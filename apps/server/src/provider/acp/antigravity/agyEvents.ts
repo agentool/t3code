@@ -362,6 +362,38 @@ export function hookSessionUpdate(
  * the safe answer is `ask`: a hook that silently allowed every tool outside a
  * managed turn would be a permission bypass.
  */
+export interface AgyHookDecision {
+  readonly decision: "allow" | "deny" | "ask";
+  readonly reason?: string;
+}
+
+/**
+ * Translate the client's `session/request_permission` reply into the decision
+ * the blocked `PreToolUse` hook will print.
+ *
+ * Fails closed: only an explicit selection of the approve option allows the
+ * tool. A cancelled prompt, an unknown option id, or a malformed reply all
+ * deny, because this is the only thing standing between the model and a tool
+ * that `agy` has already been told to run without asking.
+ */
+export function approvalOutcomeToDecision(
+  result: unknown,
+  approveOptionId: string,
+): AgyHookDecision {
+  const outcome =
+    typeof result === "object" && result !== null
+      ? (result as { outcome?: unknown }).outcome
+      : undefined;
+  const selected =
+    typeof outcome === "object" && outcome !== null
+      ? (outcome as { outcome?: unknown; optionId?: unknown })
+      : undefined;
+  if (selected?.outcome === "selected" && selected.optionId === approveOptionId) {
+    return { decision: "allow" };
+  }
+  return { decision: "deny", reason: "Rejected in T3 Code" };
+}
+
 export function agyHookResponse(event: string, observerAttached: boolean): Record<string, unknown> {
   switch (event) {
     case "pre-tool-use":

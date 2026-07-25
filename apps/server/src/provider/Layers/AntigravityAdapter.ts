@@ -5,9 +5,12 @@
  * to is T3 Code's own bridge (`t3 agy-acp`). That shapes three deliberate
  * differences from the CLI-native ACP adapters:
  *
- *   - **No permission requests.** The bridge drives `agy` with
- *     `--dangerously-skip-permissions` because print mode cannot prompt, so
- *     tools are auto-approved and no approval flow can be surfaced.
+ *   - **Approvals come from the hook, not the CLI.** `agy` always runs with
+ *     `--dangerously-skip-permissions` because print mode cannot prompt. When
+ *     `requireToolApproval` is set, the bridge's `PreToolUse` hook becomes the
+ *     gate instead: it blocks the tool until this adapter answers, and a
+ *     denial is reported back to the model. Off by default, since every
+ *     approval stops the turn until a human replies.
  *   - **No session modes.** Print mode has no plan/ask distinction to switch.
  *   - **Attachments travel by reference.** `agy --print` has no attachment
  *     flag, so files are sent as `resource_link` blocks and the bridge stages
@@ -21,11 +24,14 @@
 
 import {
   type AntigravitySettings,
+  ApprovalRequestId,
   EventId,
+  type ProviderApprovalDecision,
   type ProviderRuntimeEvent,
   type ProviderSession,
   ProviderDriverKind,
   ProviderInstanceId,
+  RuntimeRequestId,
   type ThreadId,
   TurnId,
 } from "@t3tools/contracts";
@@ -43,6 +49,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
+import * as EffectAcpErrors from "effect-acp/errors";
 import type * as EffectAcpSchema from "effect-acp/schema";
 
 import { attachmentFileUrl, resolveAttachmentPath } from "../../attachmentStore.ts";
@@ -60,8 +67,11 @@ import {
   makeAcpAssistantItemEvent,
   makeAcpContentDeltaEvent,
   makeAcpPlanUpdatedEvent,
+  makeAcpRequestOpenedEvent,
+  makeAcpRequestResolvedEvent,
   makeAcpToolCallEvent,
 } from "../acp/AcpCoreRuntimeEvents.ts";
+import { parsePermissionRequest } from "../acp/AcpRuntimeModel.ts";
 import { makeAcpNativeLoggerFactory } from "../acp/AcpNativeLogging.ts";
 import {
   makeAntigravityAcpRuntime,
@@ -136,6 +146,32 @@ function resolveEffortSelection(
   return effort === "low" || effort === "medium" || effort === "high" ? effort : undefined;
 }
 
+interface PendingApproval {
+  readonly decision: Deferred.Deferred<ProviderApprovalDecision>;
+}
+
+function selectPermissionOptionId(
+  request: EffectAcpSchema.RequestPermissionRequest,
+  decision: Exclude<ProviderApprovalDecision, "cancel">,
+): string | undefined {
+  const kind =
+    decision === "acceptForSession"
+      ? "allow_always"
+      : decision === "accept"
+        ? "allow_once"
+        : "reject_once";
+  return request.options.find((entry) => entry.kind === kind)?.optionId.trim() || undefined;
+}
+
+function selectAutoApprovedPermissionOption(
+  request: EffectAcpSchema.RequestPermissionRequest,
+): string | undefined {
+  return (
+    selectPermissionOptionId(request, "acceptForSession") ??
+    selectPermissionOptionId(request, "accept")
+  );
+}
+
 export function makeAntigravityAdapter(
   antigravitySettings: AntigravitySettings,
   options?: AntigravityAdapterLiveOptions,
@@ -156,6 +192,12 @@ export function makeAntigravityAdapter(
     const makeAcpNativeLoggers = yield* makeAcpNativeLoggerFactory();
 
     const sessions = new Map<ThreadId, AntigravitySessionContext>();
+    /**
+     * Approvals awaiting a user decision, per thread. Held outside the session
+     * context because the permission callback is registered before the context
+     * exists, and `respondToRequest` resolves entries from a different call.
+     */
+    const approvalsByThread = new Map<ThreadId, Map<ApprovalRequestId, PendingApproval>>();
     const threadLocksRef = yield* SynchronizedRef.make(new Map<string, Semaphore.Semaphore>());
     const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
 
@@ -173,6 +215,16 @@ export function makeAntigravityAdapter(
     );
     const nextEventId = Effect.map(randomUUIDv4, (id) => EventId.make(id));
     const makeEventStamp = () => Effect.all({ eventId: nextEventId, createdAt: nowIso });
+    const mapAcpCallbackFailure = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      effect.pipe(
+        Effect.mapError(
+          (cause) =>
+            new EffectAcpErrors.AcpTransportError({
+              detail: "Failed to process Antigravity ACP callback.",
+              cause,
+            }),
+        ),
+      );
 
     const offerRuntimeEvent = (event: ProviderRuntimeEvent) =>
       PubSub.publish(runtimeEventPubSub, event).pipe(Effect.asVoid);
@@ -235,6 +287,16 @@ export function makeAntigravityAdapter(
       Effect.gen(function* () {
         if (ctx.stopped) return;
         ctx.stopped = true;
+        // Anything still waiting on a human is cancelled, which the bridge
+        // turns into a denial. Left pending, the hook would block its tool
+        // until its own timeout with no one able to answer.
+        const pending = approvalsByThread.get(ctx.threadId);
+        if (pending) {
+          for (const [, approval] of pending) {
+            yield* Deferred.succeed(approval.decision, "cancel");
+          }
+          approvalsByThread.delete(ctx.threadId);
+        }
         if (ctx.notificationFiber) {
           yield* Fiber.interrupt(ctx.notificationFiber);
         }
@@ -334,6 +396,64 @@ export function makeAntigravityAdapter(
                   detail: cause.message,
                   cause,
                 }),
+            ),
+          );
+
+          // With approvals enabled the bridge blocks each tool on this callback,
+          // so it must be registered before `start()` — the first tool call can
+          // arrive as soon as the first turn begins.
+          const pendingApprovals = approvalsByThread.get(input.threadId) ?? new Map();
+          approvalsByThread.set(input.threadId, pendingApprovals);
+          yield* acp.handleRequestPermission((params) =>
+            mapAcpCallbackFailure(
+              Effect.gen(function* () {
+                if (input.runtimeMode === "full-access") {
+                  const autoApproved = selectAutoApprovedPermissionOption(params);
+                  if (autoApproved !== undefined) {
+                    return { outcome: { outcome: "selected" as const, optionId: autoApproved } };
+                  }
+                }
+                const permissionRequest = parsePermissionRequest(params);
+                const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
+                const decision = yield* Deferred.make<ProviderApprovalDecision>();
+                const turnId = sessions.get(input.threadId)?.activeTurnId;
+                pendingApprovals.set(requestId, { decision });
+                yield* offerRuntimeEvent(
+                  makeAcpRequestOpenedEvent({
+                    stamp: yield* makeEventStamp(),
+                    provider: PROVIDER,
+                    threadId: input.threadId,
+                    turnId,
+                    requestId: RuntimeRequestId.make(requestId),
+                    permissionRequest,
+                    detail: permissionRequest.detail ?? "Antigravity tool call",
+                    args: params,
+                    source: "acp.jsonrpc",
+                    method: "session/request_permission",
+                    rawPayload: params,
+                  }),
+                );
+                const resolved = yield* Deferred.await(decision);
+                pendingApprovals.delete(requestId);
+                yield* offerRuntimeEvent(
+                  makeAcpRequestResolvedEvent({
+                    stamp: yield* makeEventStamp(),
+                    provider: PROVIDER,
+                    threadId: input.threadId,
+                    turnId,
+                    requestId: RuntimeRequestId.make(requestId),
+                    permissionRequest,
+                    decision: resolved,
+                  }),
+                );
+                const optionId =
+                  resolved === "cancel" ? undefined : selectPermissionOptionId(params, resolved);
+                return {
+                  outcome: optionId
+                    ? { outcome: "selected" as const, optionId }
+                    : ({ outcome: "cancelled" } as const),
+                };
+              }),
             ),
           );
 
@@ -680,18 +800,25 @@ export function makeAntigravityAdapter(
         );
       });
 
-    // Antigravity runs every turn with `--dangerously-skip-permissions`, so
-    // the bridge never opens an approval or question request. Reaching either
-    // responder means the caller is tracking a request this provider cannot
-    // have produced.
-    const respondToRequest: AntigravityAdapterShape["respondToRequest"] = (threadId, requestId) =>
+    // `agy` itself always runs with permissions skipped — print mode cannot
+    // prompt — so when approvals are enabled the bridge's PreToolUse hook is
+    // the gate, and this resolves the decision it is blocked on.
+    const respondToRequest: AntigravityAdapterShape["respondToRequest"] = (
+      threadId,
+      requestId,
+      decision,
+    ) =>
       Effect.gen(function* () {
         yield* requireSession(threadId);
-        return yield* new ProviderAdapterRequestError({
-          provider: PROVIDER,
-          method: "session/request_permission",
-          detail: `Antigravity auto-approves tools and never opens approvals; unknown request: ${requestId}`,
-        });
+        const pending = approvalsByThread.get(threadId)?.get(requestId);
+        if (!pending) {
+          return yield* new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "session/request_permission",
+            detail: `Unknown pending approval request: ${requestId}`,
+          });
+        }
+        yield* Deferred.succeed(pending.decision, decision);
       });
 
     const respondToUserInput: AntigravityAdapterShape["respondToUserInput"] = (

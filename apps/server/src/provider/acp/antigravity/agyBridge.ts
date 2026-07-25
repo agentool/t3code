@@ -24,10 +24,14 @@ import * as NodeURL from "node:url";
 import packageJson from "../../../../package.json" with { type: "json" };
 import {
   agyHookResponse,
+  approvalOutcomeToDecision,
   agyTargetPath,
+  agyToolCallId,
   agyToolKind,
+  agyToolTitle,
   hookSessionUpdate,
   makeAgyTurnState,
+  type AgyHookDecision,
   type AgyHookEvent,
   type AgyHookPayload,
   type AgySessionUpdate,
@@ -41,6 +45,17 @@ import {
 } from "./agyTranscript.ts";
 
 const HOOK_DIR_ENV = "T3_AGY_HOOK_DIR";
+const REQUIRE_APPROVAL_ENV = "T3_AGY_REQUIRE_APPROVAL";
+/** Suffix of the file the bridge writes to answer a waiting `PreToolUse` hook. */
+const DECISION_SUFFIX = ".decision";
+/**
+ * How long a `PreToolUse` hook blocks waiting for the user. Antigravity's own
+ * hook timeout is set above this so the deny below is what actually lands,
+ * rather than the CLI abandoning the hook first.
+ */
+const APPROVAL_WAIT_MS = 10 * 60 * 1000;
+const APPROVAL_HOOK_TIMEOUT_SECONDS = 11 * 60;
+const APPROVAL_POLL_INTERVAL_MS = 50;
 const HOOK_POLL_INTERVAL_MS = 50;
 const DEFAULT_PRINT_TIMEOUT = "2h";
 const HOOKS_KEY = "t3code-antigravity-observer";
@@ -155,6 +170,58 @@ function sendSessionUpdate(sessionId: string, update: AgySessionUpdate): void {
   });
 }
 
+// ── Outbound requests ─────────────────────────────────────────────────
+//
+// The bridge is the ACP agent, so asking the client to approve a tool means
+// issuing a request in the other direction and correlating the reply.
+
+let nextOutboundId = 1;
+const pendingOutbound = new Map<
+  number,
+  { readonly resolve: (value: unknown) => void; readonly reject: (error: Error) => void }
+>();
+
+function sendRequest(method: string, params: unknown): Promise<unknown> {
+  const id = nextOutboundId;
+  nextOutboundId += 1;
+  return new Promise((resolve, reject) => {
+    pendingOutbound.set(id, { resolve, reject });
+    writeMessage({ jsonrpc: "2.0", id, method, params });
+  });
+}
+
+/**
+ * Settle an outbound request from a client reply. Returns false when the id is
+ * not one of ours, so the caller can treat the message as a request instead.
+ */
+function resolveOutbound(message: Record<string, unknown>): boolean {
+  const id = message["id"];
+  if (typeof id !== "number" || !pendingOutbound.has(id)) {
+    return false;
+  }
+  const pending = pendingOutbound.get(id);
+  pendingOutbound.delete(id);
+  if (!pending) {
+    return false;
+  }
+  const error = message["error"];
+  if (isRecord(error)) {
+    const detail = typeof error["message"] === "string" ? error["message"] : "request failed";
+    pending.reject(new Error(detail));
+  } else {
+    pending.resolve(message["result"]);
+  }
+  return true;
+}
+
+/** Reject everything still outstanding; used when the client goes away. */
+function failPendingOutbound(reason: string): void {
+  for (const [, pending] of pendingOutbound) {
+    pending.reject(new Error(reason));
+  }
+  pendingOutbound.clear();
+}
+
 // ── Hook observer ─────────────────────────────────────────────────────
 
 /**
@@ -183,16 +250,19 @@ function createHookWorkspace(): string {
   const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-agy-hooks-"));
   const agentsDir = NodePath.join(dir, ".agents");
   NodeFS.mkdirSync(agentsDir, { recursive: true });
-  const toolHook = (event: string) => [
-    { matcher: "*", hooks: [{ type: "command", command: hookCommandFor(event), timeout: 10 }] },
+  // A gating PreToolUse hook blocks while the user decides, so its timeout has
+  // to outlast the bridge's own wait; observation-only hooks stay short.
+  const preToolTimeout = approvalRequired() ? APPROVAL_HOOK_TIMEOUT_SECONDS : 10;
+  const toolHook = (event: string, timeout: number) => [
+    { matcher: "*", hooks: [{ type: "command", command: hookCommandFor(event), timeout }] },
   ];
   NodeFS.writeFileSync(
     NodePath.join(agentsDir, "hooks.json"),
     JSON.stringify(
       {
         [HOOKS_KEY]: {
-          PreToolUse: toolHook("pre-tool-use"),
-          PostToolUse: toolHook("post-tool-use"),
+          PreToolUse: toolHook("pre-tool-use", preToolTimeout),
+          PostToolUse: toolHook("post-tool-use", 10),
           Stop: [{ type: "command", command: hookCommandFor("stop"), timeout: 10 }],
         },
       },
@@ -203,14 +273,20 @@ function createHookWorkspace(): string {
   return dir;
 }
 
-function readHookEvents(hookDir: string, seen: Set<string>): ReadonlyArray<AgyHookEvent> {
+/** A hook event plus the file it came from, which keys its decision reply. */
+interface ObservedHook {
+  readonly name: string;
+  readonly event: AgyHookEvent;
+}
+
+function readHookEvents(hookDir: string, seen: Set<string>): ReadonlyArray<ObservedHook> {
   let entries: Array<string>;
   try {
     entries = NodeFS.readdirSync(hookDir);
   } catch {
     return [];
   }
-  const events: Array<AgyHookEvent> = [];
+  const events: Array<ObservedHook> = [];
   for (const name of entries.filter((n) => n.endsWith(".json")).sort()) {
     if (seen.has(name)) {
       continue;
@@ -220,7 +296,7 @@ function readHookEvents(hookDir: string, seen: Set<string>): ReadonlyArray<AgyHo
       const raw = NodeFS.readFileSync(NodePath.join(hookDir, name), "utf8");
       const parsed: unknown = JSON.parse(raw);
       if (typeof parsed === "object" && parsed !== null) {
-        events.push(parsed as AgyHookEvent);
+        events.push({ name, event: parsed as AgyHookEvent });
       }
     } catch {
       // A half-written hook file is picked up on the next poll.
@@ -228,6 +304,76 @@ function readHookEvents(hookDir: string, seen: Set<string>): ReadonlyArray<AgyHo
     }
   }
   return events;
+}
+
+// ── Tool approval ─────────────────────────────────────────────────────
+
+const APPROVE_OPTION = "allow";
+const REJECT_OPTION = "reject";
+
+function approvalRequired(): boolean {
+  return process.env[REQUIRE_APPROVAL_ENV]?.trim() === "1";
+}
+
+function decisionPath(hookDir: string, hookName: string): string {
+  return NodePath.join(hookDir, `${hookName}${DECISION_SUFFIX}`);
+}
+
+function writeDecision(hookDir: string, hookName: string, decision: AgyHookDecision): void {
+  try {
+    const target = decisionPath(hookDir, hookName);
+    const staging = `${target}.tmp`;
+    NodeFS.writeFileSync(staging, JSON.stringify(decision));
+    NodeFS.renameSync(staging, target);
+  } catch {
+    // The waiting hook falls back to denying when its deadline passes, which
+    // is the safe outcome for a permission gate.
+  }
+}
+
+/**
+ * Ask the client to approve one tool call, then hand the answer to the waiting
+ * hook process through the shared directory.
+ *
+ * Fire-and-forget by design: `drain` runs on a timer and must not block the
+ * transcript reader while a human decides.
+ */
+function requestToolApproval(input: {
+  readonly sessionId: string;
+  readonly hookDir: string;
+  readonly hookName: string;
+  readonly payload: AgyHookPayload;
+}): void {
+  const toolCall = input.payload.toolCall;
+  const stepIdx = typeof input.payload.stepIdx === "number" ? input.payload.stepIdx : 0;
+  void sendRequest("session/request_permission", {
+    sessionId: input.sessionId,
+    toolCall: {
+      toolCallId: agyToolCallId(input.payload.conversationId, stepIdx),
+      title: agyToolTitle(toolCall),
+      kind: agyToolKind(toolCall?.name),
+      status: "pending",
+      rawInput: toolCall?.args ?? null,
+      ...(agyTargetPath(toolCall) ? { locations: [{ path: agyTargetPath(toolCall) }] } : {}),
+    },
+    options: [
+      { optionId: APPROVE_OPTION, name: "Allow", kind: "allow_once" },
+      { optionId: REJECT_OPTION, name: "Reject", kind: "reject_once" },
+    ],
+  })
+    .then((result) => {
+      writeDecision(
+        input.hookDir,
+        input.hookName,
+        approvalOutcomeToDecision(result, APPROVE_OPTION),
+      );
+    })
+    .catch(() => {
+      writeDecision(input.hookDir, input.hookName, {
+        decision: "deny",
+        reason: "T3 Code could not obtain approval for this tool call",
+      });
+    });
 }
 
 /**
@@ -278,12 +424,45 @@ export async function runAgyHook(event: string): Promise<void> {
       const tempPath = `${finalPath}.tmp`;
       NodeFS.writeFileSync(tempPath, JSON.stringify(record));
       NodeFS.renameSync(tempPath, finalPath);
+
+      // With approvals on, this process is the gate: block until the bridge
+      // reports the user's answer. `deny` here genuinely stops the tool —
+      // Antigravity reports the reason back to the model.
+      if (approvalRequired() && event === "pre-tool-use" && payload?.toolCall) {
+        const decision = await awaitDecision(hookDir, name);
+        process.stdout.write(JSON.stringify(decision));
+        return;
+      }
     } catch {
       // Observation is best-effort: a hook must never break a tool call.
     }
   }
 
   process.stdout.write(JSON.stringify(agyHookResponse(event, Boolean(hookDir))));
+}
+
+/**
+ * Wait for the bridge's answer to one `PreToolUse` hook.
+ *
+ * Fails closed: if the bridge dies, the client never answers, or the deadline
+ * passes, the tool is denied rather than quietly allowed.
+ */
+async function awaitDecision(hookDir: string, hookName: string): Promise<AgyHookDecision> {
+  const target = decisionPath(hookDir, hookName);
+  const deadline = Date.now() + APPROVAL_WAIT_MS;
+  while (Date.now() < deadline) {
+    try {
+      const raw = NodeFS.readFileSync(target, "utf8");
+      const parsed: unknown = JSON.parse(raw);
+      if (isRecord(parsed) && (parsed["decision"] === "allow" || parsed["decision"] === "deny")) {
+        return parsed as unknown as AgyHookDecision;
+      }
+    } catch {
+      // Not written yet, or written partially; try again.
+    }
+    await new Promise((resolve) => setTimeout(resolve, APPROVAL_POLL_INTERVAL_MS));
+  }
+  return { decision: "deny", reason: "Timed out waiting for approval in T3 Code" };
 }
 
 // ── Turn execution ────────────────────────────────────────────────────
@@ -466,7 +645,7 @@ function drain(input: {
   readonly assistantText: { emitted: boolean };
   readonly final: boolean;
 }): void {
-  for (const hook of readHookEvents(input.hookDir, input.seenHooks)) {
+  for (const { name, event: hook } of readHookEvents(input.hookDir, input.seenHooks)) {
     // Diffing the file contents each hook captured, rather than the arguments
     // of the edit, keeps this correct across tools whose argument shapes
     // differ (`replace_file_content` sends a fragment, `write_to_file` sends
@@ -475,6 +654,16 @@ function drain(input: {
     const update = hookSessionUpdate(hook, input.state, fileText);
     if (update) {
       sendSessionUpdate(input.sessionId, update);
+    }
+    // The hook process is blocked until a decision file appears, so this has
+    // to be started for every announced tool call.
+    if (approvalRequired() && hook.event === "pre-tool-use" && hook.payload?.toolCall) {
+      requestToolApproval({
+        sessionId: input.sessionId,
+        hookDir: input.hookDir,
+        hookName: name,
+        payload: hook.payload,
+      });
     }
   }
 
@@ -853,6 +1042,13 @@ export async function runAgyBridge(): Promise<void> {
         continue;
       }
 
+      // A reply to one of the bridge's own requests (tool approval) carries an
+      // id but no method, and must never enter the request queue — the turn
+      // holding that queue is exactly what is waiting on the answer.
+      if (message["method"] === undefined && resolveOutbound(message)) {
+        continue;
+      }
+
       // Cancellation must interrupt an in-flight turn, so it bypasses the
       // queue that would otherwise make it wait for that turn to finish.
       if (message["method"] === "session/cancel") {
@@ -873,6 +1069,9 @@ export async function runAgyBridge(): Promise<void> {
     }
   }
 
+  // stdin closed: no approval can still be answered, so unblock the hooks
+  // waiting on them (they fail closed) rather than letting them time out.
+  failPendingOutbound("T3 Code disconnected before approving this tool call");
   await queue;
   activeChild?.kill("SIGTERM");
 }

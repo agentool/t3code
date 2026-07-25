@@ -29,7 +29,7 @@ export const DEFAULT_ANTIGRAVITY_MODEL = "gemini-3.1-pro-high";
 
 type AntigravityAcpRuntimeSettings = Pick<
   AntigravitySettings,
-  "binaryPath" | "printTimeout" | "appDataDir"
+  "binaryPath" | "printTimeout" | "appDataDir" | "requireToolApproval"
 >;
 
 interface AntigravityAcpRuntimeInput extends Omit<
@@ -78,6 +78,9 @@ export function buildAntigravityAcpSpawnInput(input: {
   }
   if (settings?.appDataDir?.trim()) {
     env["T3_AGY_APP_DATA_DIR"] = settings.appDataDir.trim();
+  }
+  if (settings?.requireToolApproval) {
+    env["T3_AGY_REQUIRE_APPROVAL"] = "1";
   }
   if (input.model?.trim()) {
     env["T3_AGY_MODEL"] = input.model.trim();

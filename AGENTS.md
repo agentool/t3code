@@ -40,14 +40,19 @@ step index (`stepIdx` in a hook == `step_index` in the transcript):
 
 Known constraints, all inherent to print mode:
 
-- Tools are auto-approved (`--dangerously-skip-permissions`); no approval flow is possible.
+- `agy` always runs with `--dangerously-skip-permissions` because print mode cannot prompt.
+  Approvals instead come from the `PreToolUse` hook, which blocks the tool until T3 Code
+  answers — a `deny` decision genuinely stops it and is reported back to the model. Enable
+  with the `requireToolApproval` setting; it is off by default because each approval blocks
+  the turn on a human, and it fails closed on timeout or a lost bridge.
 - Attachments are passed by path, not inline: the adapter sends `resource_link` blocks for
   files the attachment store already wrote to disk, and the bridge names those paths in the
   prompt and adds their directory to the workspace. `agy` has no attachment flag, so inline
   image capability stays off.
 - No session modes, and no provider-side rollback — a resumed conversation keeps its full
   trajectory, so `rollbackThread` fails rather than silently truncating local state only.
-- The model binds when the bridge spawns `agy`, so `sessionModelSwitch` is `"unsupported"`.
+- `--model` is a per-spawn flag that composes with `--conversation`, so a model switch keeps
+  the trajectory and applies from the next turn (`sessionModelSwitch: "in-session"`).
 - Any `agy` subcommand spawned for a probe must set `stdin: "ignore"`. `agy` starts a language
   server and will not emit output while stdin stays open, so the default `"pipe"` hangs it.
 

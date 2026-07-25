@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   agyHookResponse,
+  approvalOutcomeToDecision,
   agyTargetPath,
   agyToolCallId,
   agyToolKind,
@@ -215,6 +216,31 @@ describe("hookSessionUpdate", () => {
     );
 
     expect(update).not.toHaveProperty("content");
+  });
+});
+
+describe("approvalOutcomeToDecision", () => {
+  it("allows only an explicit selection of the approve option", () => {
+    expect(
+      approvalOutcomeToDecision({ outcome: { outcome: "selected", optionId: "allow" } }, "allow"),
+    ).toEqual({ decision: "allow" });
+  });
+
+  it("denies every other reply", () => {
+    // This is the only gate in front of a CLI already told to skip its own
+    // permission prompts, so anything ambiguous has to deny.
+    for (const reply of [
+      { outcome: { outcome: "selected", optionId: "reject" } },
+      { outcome: { outcome: "cancelled" } },
+      { outcome: { outcome: "selected" } },
+      { outcome: null },
+      {},
+      null,
+      undefined,
+      "allow",
+    ]) {
+      expect(approvalOutcomeToDecision(reply, "allow").decision).toBe("deny");
+    }
   });
 });
 

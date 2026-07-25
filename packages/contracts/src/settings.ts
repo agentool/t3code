@@ -373,13 +373,25 @@ export const AntigravitySettings = makeProviderSettingsSchema(
         providerSettingsForm: { placeholder: "~/.gemini/antigravity-cli", clearWhenEmpty: "omit" },
       }),
     ),
+    // Print mode cannot prompt, so `agy` runs with permissions skipped and the
+    // bridge's PreToolUse hook becomes the gate instead: it blocks the tool
+    // until T3 Code answers, and a denial is reported back to the model.
+    // Off by default because every approval blocks the turn on a human.
+    requireToolApproval: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({
+        title: "Ask before running tools",
+        description:
+          "Approve each tool call before Antigravity runs it. Turns block until you answer.",
+      }),
+    ),
     customModels: Schema.Array(Schema.String).pipe(
       Schema.withDecodingDefault(Effect.succeed([])),
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
   },
   {
-    order: ["binaryPath", "printTimeout", "appDataDir"],
+    order: ["binaryPath", "printTimeout", "appDataDir", "requireToolApproval"],
   },
 );
 export type AntigravitySettings = typeof AntigravitySettings.Type;
