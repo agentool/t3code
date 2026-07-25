@@ -119,6 +119,28 @@ describe("transcriptRecordUpdates", () => {
     });
   });
 
+  it("still attaches output after the post hook completed the call", () => {
+    // One drain pass reads hooks before the transcript, so for a fast tool the
+    // PostToolUse hook and the record carrying its output arrive together. If
+    // completing a call dropped its bookkeeping, that output would be lost.
+    const state = stateWithActiveTool(3);
+    hookSessionUpdate(
+      { event: "post-tool-use", payload: { conversationId: "conversation-1", stepIdx: 3 } },
+      state,
+    );
+
+    const result = transcriptRecordUpdates(
+      { step_index: 3, source: "MODEL", type: "RUN_COMMAND", content: "Created At: x\nok" },
+      state,
+    );
+
+    expect(result.updates[0]).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "agy-conversation-1-3",
+      content: [{ type: "content", content: { type: "text", text: "ok" } }],
+    });
+  });
+
   it("drops tool output with no announced call rather than inventing one", () => {
     const result = transcriptRecordUpdates(
       { step_index: 99, source: "MODEL", type: "RUN_COMMAND", content: "orphan" },

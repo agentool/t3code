@@ -167,30 +167,42 @@ export function agyUpdateMeta(event: string, payload: AgyHookPayload): Record<st
   };
 }
 
-export interface AgyActiveToolCall {
+export interface AgyToolCallRecord {
   readonly toolCallId: string;
   readonly name: string | undefined;
   readonly kind: AcpToolKind;
   readonly targetPath: string | undefined;
   /** File contents captured at `PreToolUse`, used to build an edit diff. */
   readonly beforeText: string | undefined;
+  /** Set by `PostToolUse`. Records are kept after completion so a transcript
+   * record that lands in the same poll can still attach the tool's output. */
+  completed: boolean;
 }
 
 /**
  * Mutable bookkeeping shared by the hook and transcript readers for one turn.
  */
 export interface AgyTurnState {
-  readonly activeToolCalls: Map<number, AgyActiveToolCall>;
+  /**
+   * Every tool call seen this turn, keyed by step index — completed ones
+   * included. The two event sources are drained in the same pass, so a step
+   * must stay addressable after its `PostToolUse` hook or its transcript
+   * output would be dropped whenever both arrive within one poll.
+   */
+  readonly toolCalls: Map<number, AgyToolCallRecord>;
   conversationId: string | undefined;
   transcriptPath: string | undefined;
+  /** Transcript file pinned for the turn; see `resolveTranscriptPath`. */
+  resolvedTranscriptPath: string | undefined;
   modelName: string | undefined;
 }
 
 export function makeAgyTurnState(conversationId?: string): AgyTurnState {
   return {
-    activeToolCalls: new Map(),
+    toolCalls: new Map(),
     conversationId,
     transcriptPath: undefined,
+    resolvedTranscriptPath: undefined,
     modelName: undefined,
   };
 }
@@ -223,12 +235,13 @@ export function preToolUseUpdate(
   const toolCallId = agyToolCallId(payload.conversationId, stepIdx);
   const kind = agyToolKind(toolCall.name);
   const targetPath = agyTargetPath(toolCall);
-  state.activeToolCalls.set(stepIdx, {
+  state.toolCalls.set(stepIdx, {
     toolCallId,
     name: toolCall.name,
     kind,
     targetPath,
     beforeText,
+    completed: false,
   });
 
   return {
@@ -259,13 +272,16 @@ export function postToolUseUpdate(
   if (typeof stepIdx !== "number") {
     return null;
   }
-  const active = state.activeToolCalls.get(stepIdx);
+  const active = state.toolCalls.get(stepIdx);
   // Only complete calls whose `PreToolUse` we actually observed; Antigravity
   // emits unpaired post hooks for internal steps.
-  if (!active) {
+  if (!active || active.completed) {
     return null;
   }
-  state.activeToolCalls.delete(stepIdx);
+  // Marked rather than removed: the transcript record carrying this step's
+  // output is often read in the same drain pass, and dropping the entry here
+  // would leave it with no tool call to attach to.
+  active.completed = true;
 
   const error = typeof payload.error === "string" ? payload.error.trim() : "";
   const failed = error.length > 0;

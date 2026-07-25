@@ -80,7 +80,7 @@ describe("hookSessionUpdate", () => {
       status: "in_progress",
       rawInput: { CommandLine: "ls -la src" },
     });
-    expect(state.activeToolCalls.has(3)).toBe(true);
+    expect(state.toolCalls.get(3)?.completed).toBe(false);
   });
 
   it("learns the conversation and transcript from any hook, not just stop", () => {
@@ -102,7 +102,7 @@ describe("hookSessionUpdate", () => {
     );
 
     expect(update).toBeNull();
-    expect(state.activeToolCalls.size).toBe(0);
+    expect(state.toolCalls.size).toBe(0);
   });
 
   it("completes a tool call that was announced", () => {
@@ -121,7 +121,21 @@ describe("hookSessionUpdate", () => {
       status: "completed",
       rawOutput: { isError: false },
     });
-    expect(state.activeToolCalls.size).toBe(0);
+    // Retained, not deleted: the transcript record carrying this step's output
+    // is often read in the same drain pass and still needs the tool call id.
+    expect(state.toolCalls.get(3)?.completed).toBe(true);
+  });
+
+  it("ignores a duplicate post hook for an already completed step", () => {
+    const state = makeAgyTurnState();
+    hookSessionUpdate(preToolUse(), state);
+    const post = {
+      event: "post-tool-use",
+      payload: { conversationId: "conversation-1", stepIdx: 3, error: "" },
+    } as const;
+
+    expect(hookSessionUpdate(post, state)).not.toBeNull();
+    expect(hookSessionUpdate(post, state)).toBeNull();
   });
 
   it("marks a tool call failed and carries the error through", () => {

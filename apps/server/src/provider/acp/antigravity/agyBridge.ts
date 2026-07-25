@@ -90,15 +90,18 @@ function persistConversationId(sessionId: string, conversationId: string): void 
   }
 }
 
+/**
+ * Map a bridge session id to the Antigravity conversation it should resume.
+ *
+ * The persisted map is the only authority. Bridge session ids are themselves
+ * random UUIDs, so an id that merely looks like a conversation id is
+ * indistinguishable from one the bridge minted — falling back to the shape of
+ * the string would make `session/load` resume a conversation that never
+ * existed whenever the map is missing or unreadable. Returning `undefined`
+ * starts a fresh conversation, which is the recoverable outcome.
+ */
 function lookupConversationId(sessionId: string): string | undefined {
-  const mapped = readSessionMap()[sessionId]?.trim();
-  if (mapped) {
-    return mapped;
-  }
-  // A caller may hand back an Antigravity conversation UUID directly.
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId)
-    ? sessionId
-    : undefined;
+  return readSessionMap()[sessionId]?.trim() || undefined;
 }
 
 // ── JSON-RPC plumbing ─────────────────────────────────────────────────
@@ -312,6 +315,8 @@ interface TurnOutcome {
 }
 
 let activeChild: NodeChildProcess.ChildProcess | null = null;
+/** Session whose turn is currently running, if any. Gates `session/cancel`. */
+let activeTurnSessionId: string | null = null;
 const cancelledSessions = new Set<string>();
 
 /**
@@ -385,14 +390,24 @@ function drain(input: {
  * Hooks report `transcript_full.jsonl`; the sibling `transcript.jsonl` holds
  * the same steps without internal model chatter and is the better stream to
  * render.
+ *
+ * The choice is pinned for the rest of the turn. `transcriptOffset` and the
+ * line cursor are byte positions into whichever file was picked, so switching
+ * once the condensed file appears would resume reading at an offset that means
+ * nothing in the new file — skipping records, or re-emitting ones already
+ * streamed from the other one.
  */
 function resolveTranscriptPath(state: AgyTurnState): string | undefined {
+  if (state.resolvedTranscriptPath) {
+    return state.resolvedTranscriptPath;
+  }
   const reported = state.transcriptPath;
   if (!reported) {
     return undefined;
   }
   const condensed = reported.replace(/transcript_full\.jsonl$/, "transcript.jsonl");
-  return NodeFS.existsSync(condensed) ? condensed : reported;
+  state.resolvedTranscriptPath = NodeFS.existsSync(condensed) ? condensed : reported;
+  return state.resolvedTranscriptPath;
 }
 
 async function runTurn(
@@ -400,6 +415,8 @@ async function runTurn(
   session: BridgeSession,
   prompt: string,
 ): Promise<TurnOutcome> {
+  // A cancel that raced the end of an earlier turn must not decide this one.
+  cancelledSessions.delete(sessionId);
   const hookDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-agy-hookout-"));
   const hookWorkspace = createHookWorkspace();
   const command = process.env["T3_AGY_COMMAND"]?.trim() || "agy";
@@ -415,6 +432,7 @@ async function runTurn(
     stdio: ["ignore", "pipe", "pipe"],
   });
   activeChild = child;
+  activeTurnSessionId = sessionId;
 
   let stdout = "";
   let stderr = "";
@@ -447,6 +465,7 @@ async function runTurn(
 
   clearInterval(poller);
   activeChild = null;
+  activeTurnSessionId = null;
   drain({
     sessionId,
     hookDir,
@@ -459,15 +478,18 @@ async function runTurn(
   });
 
   // Any tool still open at exit would otherwise render as spinning forever.
-  for (const [, active] of state.activeToolCalls) {
+  for (const [, call] of state.toolCalls) {
+    if (call.completed) {
+      continue;
+    }
     sendSessionUpdate(sessionId, {
       sessionUpdate: "tool_call_update",
-      toolCallId: active.toolCallId,
+      toolCallId: call.toolCallId,
       status: "failed",
       rawOutput: { isError: true, error: "Antigravity exited before the tool reported completion" },
     });
   }
-  state.activeToolCalls.clear();
+  state.toolCalls.clear();
 
   if (state.conversationId) {
     session.conversationId = state.conversationId;
@@ -586,10 +608,14 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
     }
     case "session/cancel": {
       const sessionId = typeof params["sessionId"] === "string" ? params["sessionId"] : undefined;
-      if (sessionId) {
+      // Only a cancel aimed at the turn actually running can decide its stop
+      // reason. Cancels bypass the request queue, so one that arrives after a
+      // turn has already finished — or targets an idle session — would
+      // otherwise sit in the set and mark the next successful turn cancelled.
+      if (sessionId && sessionId === activeTurnSessionId) {
         cancelledSessions.add(sessionId);
+        activeChild?.kill("SIGTERM");
       }
-      activeChild?.kill("SIGTERM");
       return;
     }
     default: {

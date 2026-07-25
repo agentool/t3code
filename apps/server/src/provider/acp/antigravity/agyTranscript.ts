@@ -130,7 +130,10 @@ export function transcriptRecordUpdates(
   if (typeof stepIndex !== "number") {
     return { updates: [], emittedAssistantText: false };
   }
-  const active = state.activeToolCalls.get(stepIndex);
+  // Completed calls stay in the map precisely so this lookup still resolves:
+  // a fast tool's `PostToolUse` hook and its transcript record routinely land
+  // in the same drain pass, and hooks are read first.
+  const active = state.toolCalls.get(stepIndex);
   if (!active) {
     return { updates: [], emittedAssistantText: false };
   }

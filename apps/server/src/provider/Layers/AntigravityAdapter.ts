@@ -485,6 +485,24 @@ export function makeAntigravityAdapter(
     const sendTurn: AntigravityAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(input.threadId);
+
+        // The bridge declares no image capability: `agy --print` takes text
+        // only, so attachments cannot be forwarded. This runs before any
+        // `turn.started` is offered — a rejected prompt that had already
+        // announced a turn would leave the UI with one that never completes.
+        const promptParts: Array<EffectAcpSchema.ContentBlock> = [];
+        if (input.input?.trim()) {
+          promptParts.push({ type: "text", text: input.input.trim() });
+        }
+        if (promptParts.length === 0) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "sendTurn",
+            issue:
+              "Turn requires non-empty text. Antigravity print mode does not accept attachments.",
+          });
+        }
+
         // A sendTurn while a prompt is in flight is a steer: the new prompt
         // folds into the ongoing work, so the active turn id is reused.
         const steeringTurnId = ctx.promptsInFlight > 0 ? ctx.activeTurnId : undefined;
@@ -507,21 +525,6 @@ export function makeAntigravityAdapter(
               threadId: input.threadId,
               turnId,
               payload: { model: ctx.session.model },
-            });
-          }
-
-          // The bridge declares no image capability: `agy --print` takes text
-          // only, so attachments cannot be forwarded.
-          const promptParts: Array<EffectAcpSchema.ContentBlock> = [];
-          if (input.input?.trim()) {
-            promptParts.push({ type: "text", text: input.input.trim() });
-          }
-          if (promptParts.length === 0) {
-            return yield* new ProviderAdapterValidationError({
-              provider: PROVIDER,
-              operation: "sendTurn",
-              issue:
-                "Turn requires non-empty text. Antigravity print mode does not accept attachments.",
             });
           }
 
