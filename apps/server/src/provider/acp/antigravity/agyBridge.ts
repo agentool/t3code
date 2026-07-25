@@ -83,50 +83,40 @@ const sessions = new Map<string, BridgeSession>();
 // `session/load` — potentially in a fresh bridge process — can still resume
 // the right conversation.
 
-function stateFilePath(): string {
+function stateDirPath(): string {
   const appDataDir =
     process.env["T3_AGY_APP_DATA_DIR"]?.trim() ||
     NodePath.join(NodeOS.homedir(), ".gemini", "antigravity-cli");
-  return NodePath.join(appDataDir, "t3code-acp-sessions.json");
+  return NodePath.join(appDataDir, "t3code-acp-sessions");
 }
 
-function readSessionMap(): Record<string, string> {
-  try {
-    const parsed: unknown = JSON.parse(NodeFS.readFileSync(stateFilePath(), "utf8"));
-    if (typeof parsed !== "object" || parsed === null) {
-      return {};
-    }
-    // The bridge does not exclusively own this file, so entries are validated
-    // rather than cast. A non-string value reaching a caller would throw and
-    // leave the request it came from unanswered.
-    const map: Record<string, string> = {};
-    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-      if (typeof value === "string") {
-        map[key] = value;
-      }
-    }
-    return map;
-  } catch {
-    return {};
-  }
+/**
+ * One file per session rather than a shared map.
+ *
+ * Several bridge processes can finish turns at once, and a shared map means a
+ * read-modify-write: two writers would each rebuild it from their own stale
+ * snapshot and the later rename would drop the other's entry, silently losing
+ * a thread's conversation. Independent files never contend.
+ *
+ * Returns undefined for a session id that is not a plain token, since the id
+ * becomes a filename and is supplied by the client.
+ */
+function sessionFilePath(sessionId: string): string | undefined {
+  return /^[A-Za-z0-9_-]{1,128}$/.test(sessionId)
+    ? NodePath.join(stateDirPath(), `${sessionId}.json`)
+    : undefined;
 }
 
 function persistConversationId(sessionId: string, conversationId: string): void {
+  const target = sessionFilePath(sessionId);
+  if (!target) {
+    return;
+  }
   try {
-    const target = stateFilePath();
     NodeFS.mkdirSync(NodePath.dirname(target), { recursive: true });
-    const map = readSessionMap();
-    if (map[sessionId] === conversationId) {
-      return;
-    }
-    map[sessionId] = conversationId;
-    // Written through a uniquely-named temp file and renamed into place. The
-    // map is now the sole resume authority and several bridge processes can
-    // finish turns at once; a partial write would be read back as empty JSON
-    // and silently start a fresh conversation. Rename is atomic within a
-    // filesystem, so a reader sees either the old file or the complete new one.
+    // Written aside and renamed so a reader never sees a partial file.
     const staging = `${target}.${process.pid}.${NodeCrypto.randomUUID()}.tmp`;
-    NodeFS.writeFileSync(staging, JSON.stringify(map, null, 2));
+    NodeFS.writeFileSync(staging, JSON.stringify({ conversationId }));
     NodeFS.renameSync(staging, target);
   } catch {
     // Losing the mapping costs conversation continuity on the next resume,
@@ -137,15 +127,30 @@ function persistConversationId(sessionId: string, conversationId: string): void 
 /**
  * Map a bridge session id to the Antigravity conversation it should resume.
  *
- * The persisted map is the only authority. Bridge session ids are themselves
- * random UUIDs, so an id that merely looks like a conversation id is
+ * The persisted record is the only authority. Bridge session ids are random
+ * UUIDs themselves, so an id that merely looks like a conversation id is
  * indistinguishable from one the bridge minted — falling back to the shape of
  * the string would make `session/load` resume a conversation that never
- * existed whenever the map is missing or unreadable. Returning `undefined`
- * starts a fresh conversation, which is the recoverable outcome.
+ * existed. Returning undefined starts a fresh one, which is recoverable.
  */
 function lookupConversationId(sessionId: string): string | undefined {
-  return readSessionMap()[sessionId]?.trim() || undefined;
+  const target = sessionFilePath(sessionId);
+  if (!target) {
+    return undefined;
+  }
+  try {
+    const parsed: unknown = JSON.parse(NodeFS.readFileSync(target, "utf8"));
+    if (typeof parsed !== "object" || parsed === null) {
+      return undefined;
+    }
+    // Validated rather than cast: the bridge does not exclusively own this
+    // file, and a non-string value would throw and leave the request that read
+    // it unanswered.
+    const value = (parsed as { conversationId?: unknown }).conversationId;
+    return typeof value === "string" ? value.trim() || undefined : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // ── JSON-RPC plumbing ─────────────────────────────────────────────────
@@ -520,35 +525,47 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * Only `file:` URIs are taken: a remote URL is left in the prompt text for the
  * agent's own fetch tool, and passing one to `--add-dir` would be meaningless.
  */
-function collectAttachments(promptBlocks: ReadonlyArray<unknown>): ReadonlyArray<PromptAttachment> {
-  const attachments: Array<PromptAttachment> = [];
+function collectAttachments(promptBlocks: ReadonlyArray<unknown>): {
+  readonly files: ReadonlyArray<PromptAttachment>;
+  readonly remoteUris: ReadonlyArray<string>;
+} {
+  const files: Array<PromptAttachment> = [];
+  const remoteUris: Array<string> = [];
   for (const block of promptBlocks) {
     if (!isRecord(block) || block["type"] !== "resource_link") {
       continue;
     }
     const uri = block["uri"];
-    if (typeof uri !== "string" || !uri.startsWith("file://")) {
+    if (typeof uri !== "string" || uri.length === 0) {
+      continue;
+    }
+    if (!uri.startsWith("file://")) {
+      // `resource_link` is baseline ACP, so a remote link has to reach the
+      // agent: it goes into the prompt text for Antigravity's own fetch tool.
+      remoteUris.push(uri);
       continue;
     }
     let filePath: string;
     try {
       filePath = NodeURL.fileURLToPath(uri);
     } catch {
+      remoteUris.push(uri);
       continue;
     }
     const name = typeof block["name"] === "string" ? block["name"] : NodePath.basename(filePath);
-    attachments.push({
+    files.push({
       path: filePath,
       name,
       mimeType: typeof block["mimeType"] === "string" ? block["mimeType"] : undefined,
     });
   }
-  return attachments;
+  return { files, remoteUris };
 }
 
 interface RenderedPrompt {
   readonly baseText: string;
   readonly attachments: ReadonlyArray<PromptAttachment>;
+  readonly remoteUris: ReadonlyArray<string>;
 }
 
 function renderPrompt(session: BridgeSession, promptBlocks: unknown): RenderedPrompt | null {
@@ -564,15 +581,16 @@ function renderPrompt(session: BridgeSession, promptBlocks: unknown): RenderedPr
     .join("\n\n")
     .trim();
 
-  const attachments = collectAttachments(promptBlocks);
-  if (text.length === 0 && attachments.length === 0) {
+  const { files, remoteUris } = collectAttachments(promptBlocks);
+  if (text.length === 0 && files.length === 0 && remoteUris.length === 0) {
     return null;
   }
 
   const systemPrompt = session.systemPrompt?.trim();
   return {
     baseText: systemPrompt ? `System instructions:\n${systemPrompt}\n\nRequest:\n${text}` : text,
-    attachments,
+    attachments: files,
+    remoteUris,
   };
 }
 
@@ -599,24 +617,29 @@ function stageAttachments(attachments: ReadonlyArray<PromptAttachment>): {
     // collide and a crafted name cannot escape the staging directory.
     const safeName = `${index}-${NodePath.basename(attachment.name).replace(/[^\w.-]+/g, "_")}`;
     const target = NodePath.join(dir, safeName);
-    try {
-      NodeFS.copyFileSync(attachment.path, target);
-    } catch {
-      // An unreadable attachment is dropped rather than failing the whole turn.
-      return;
-    }
+    // Not swallowed: silently dropping an attachment would run the turn
+    // against a prompt the user did not write, and an attachment-only request
+    // would become an empty prompt that still reports success.
+    NodeFS.copyFileSync(attachment.path, target);
     staged.push({ path: target, name: safeName, mimeType: attachment.mimeType });
   });
   return { dir, staged };
 }
 
-function composePromptText(baseText: string, staged: ReadonlyArray<PromptAttachment>): string {
-  if (staged.length === 0) {
-    return baseText;
+function composePromptText(
+  baseText: string,
+  staged: ReadonlyArray<PromptAttachment>,
+  remoteUris: ReadonlyArray<string>,
+): string {
+  const blocks: Array<string> = [];
+  if (staged.length > 0) {
+    const list = staged.map((a) => `- ${a.path}${a.mimeType ? ` (${a.mimeType})` : ""}`).join("\n");
+    blocks.push(`Attached files (read them from these paths):\n${list}`);
   }
-  const list = staged.map((a) => `- ${a.path}${a.mimeType ? ` (${a.mimeType})` : ""}`).join("\n");
-  const block = `Attached files (read them from these paths):\n${list}`;
-  return baseText.length > 0 ? `${baseText}\n\n${block}` : block;
+  if (remoteUris.length > 0) {
+    blocks.push(`Attached links (fetch them):\n${remoteUris.map((u) => `- ${u}`).join("\n")}`);
+  }
+  return [baseText, ...blocks].filter((part) => part.length > 0).join("\n\n");
 }
 
 interface TurnOutcome {
@@ -653,7 +676,15 @@ function drain(input: {
     const fileText = hook.capturedFileText ?? undefined;
     const update = hookSessionUpdate(hook, input.state, fileText);
     if (update) {
-      sendSessionUpdate(input.sessionId, update);
+      const stepIdx = hook.payload?.stepIdx;
+      if (hook.event === "post-tool-use" && typeof stepIdx === "number") {
+        // Held back rather than sent: the transcript record carrying this
+        // step's real output is usually read later in this same pass, and a
+        // completed call can no longer take content.
+        input.state.pendingTerminal.set(stepIdx, update);
+      } else {
+        sendSessionUpdate(input.sessionId, update);
+      }
     }
     // The hook process is blocked until a decision file appears, so this has
     // to be started for every announced tool call.
@@ -708,8 +739,32 @@ function drain(input: {
       if (result.emittedAssistantText) {
         input.assistantText.emitted = true;
       }
+      // This step's output is out; the call can be completed now.
+      const stepIndex = record.step_index;
+      if (typeof stepIndex === "number") {
+        flushTerminal(input.sessionId, input.state, stepIndex);
+      }
     }
   }
+
+  // Nothing more will arrive, so anything still waiting on a transcript record
+  // that never came is completed without output rather than left spinning.
+  if (input.final) {
+    const remaining = [...input.state.pendingTerminal.values()];
+    input.state.pendingTerminal.clear();
+    for (const terminal of remaining) {
+      sendSessionUpdate(input.sessionId, terminal);
+    }
+  }
+}
+
+function flushTerminal(sessionId: string, state: AgyTurnState, stepIdx: number): void {
+  const terminal = state.pendingTerminal.get(stepIdx);
+  if (!terminal) {
+    return;
+  }
+  state.pendingTerminal.delete(stepIdx);
+  sendSessionUpdate(sessionId, terminal);
 }
 
 /**
@@ -764,7 +819,7 @@ async function runTurn(
         session,
         hookWorkspace,
         attachmentDir,
-        promptText: composePromptText(prompt.baseText, attachments.staged),
+        promptText: composePromptText(prompt.baseText, attachments.staged, prompt.remoteUris),
       }),
       {
         cwd: session.cwd,

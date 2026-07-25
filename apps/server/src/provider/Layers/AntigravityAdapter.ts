@@ -667,9 +667,11 @@ export function makeAntigravityAdapter(
         const steeringTurnId = ctx.promptsInFlight > 0 ? ctx.activeTurnId : undefined;
         const turnId = steeringTurnId ?? TurnId.make(yield* randomUUIDv4);
         ctx.promptsInFlight += 1;
-        // Tracks whether a terminal event was published on the success path, so
-        // the teardown below can tell "already reported" from "died silently".
-        let settled = false;
+        // Terminal-event bookkeeping. Publication happens in exactly one place
+        // (the teardown below) so that the decision cannot race a steer.
+        let turnStarted = steeringTurnId !== undefined;
+        let stopReason: string | null = null;
+        let promptSucceeded = false;
 
         return yield* Effect.gen(function* () {
           ctx.activeTurnId = turnId;
@@ -679,22 +681,11 @@ export function makeAntigravityAdapter(
             updatedAt: yield* nowIso,
           };
 
-          if (steeringTurnId === undefined) {
-            yield* offerRuntimeEvent({
-              type: "turn.started",
-              ...(yield* makeEventStamp()),
-              provider: PROVIDER,
-              threadId: input.threadId,
-              turnId,
-              payload: { model: ctx.session.model },
-            });
-          }
-
           // `agy` binds the model with a `--model` flag on each spawn, and that
           // flag composes with `--conversation` — verified against the CLI: a
           // resumed conversation answers on the new model with its history
-          // intact. So a switch is applied to the bridge session here and takes
-          // effect on the turn about to run.
+          // intact. Applied before `turn.started` so the announced model is the
+          // one the turn actually runs on.
           const turnModelSelection =
             input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
           const requestedModelId = turnModelSelection?.model
@@ -710,6 +701,18 @@ export function makeAntigravityAdapter(
               );
             ctx.currentModelId = requestedModelId;
             ctx.session = { ...ctx.session, model: turnModelSelection?.model ?? ctx.session.model };
+          }
+
+          if (steeringTurnId === undefined) {
+            yield* offerRuntimeEvent({
+              type: "turn.started",
+              ...(yield* makeEventStamp()),
+              provider: PROVIDER,
+              threadId: input.threadId,
+              turnId,
+              payload: { model: ctx.session.model },
+            });
+            turnStarted = true;
           }
 
           const result = yield* ctx.acp
@@ -732,22 +735,8 @@ export function makeAntigravityAdapter(
             updatedAt: yield* nowIso,
           };
 
-          // Only the last remaining prompt settles the turn, so a steer-
-          // superseded prompt resolving does not end the merged turn.
-          if (ctx.promptsInFlight === 1) {
-            yield* offerRuntimeEvent({
-              type: "turn.completed",
-              ...(yield* makeEventStamp()),
-              provider: PROVIDER,
-              threadId: input.threadId,
-              turnId,
-              payload: {
-                state: result.stopReason === "cancelled" ? "cancelled" : "completed",
-                stopReason: result.stopReason ?? null,
-              },
-            });
-            settled = true;
-          }
+          promptSucceeded = true;
+          stopReason = result.stopReason ?? null;
 
           return {
             threadId: input.threadId,
@@ -757,13 +746,12 @@ export function makeAntigravityAdapter(
         }).pipe(
           Effect.ensuring(
             Effect.gen(function* () {
+              // Decrement and the last-prompt test are one synchronous step, so
+              // a steer arriving mid-settlement cannot make two prompts both
+              // believe they own the turn and publish a terminal event each.
               const remaining = Math.max(0, ctx.promptsInFlight - 1);
               ctx.promptsInFlight = remaining;
-              // A prompt that failed or was interrupted after `turn.started`
-              // was announced still owes consumers a terminal event; without
-              // one the turn renders as running forever even though sendTurn
-              // has already returned an error.
-              if (settled || remaining > 0) {
+              if (remaining > 0 || !turnStarted) {
                 return;
               }
               if (ctx.activeTurnId === turnId) {
@@ -775,13 +763,22 @@ export function makeAntigravityAdapter(
                 const { activeTurnId: _endedTurnId, ...endedSession } = ctx.session;
                 ctx.session = { ...endedSession, status: "ready", updatedAt: yield* nowIso };
               }
+              // A prompt that failed or was interrupted after `turn.started`
+              // still owes consumers a terminal event; without one the turn
+              // renders as running forever even though sendTurn already
+              // returned an error.
+              const state = !promptSucceeded
+                ? "failed"
+                : stopReason === "cancelled"
+                  ? "cancelled"
+                  : "completed";
               yield* offerRuntimeEvent({
                 type: "turn.completed",
                 ...(yield* makeEventStamp()),
                 provider: PROVIDER,
                 threadId: input.threadId,
                 turnId,
-                payload: { state: "failed", stopReason: null },
+                payload: { state, stopReason },
               });
             }).pipe(Effect.catch(() => Effect.void)),
           ),

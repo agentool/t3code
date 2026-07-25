@@ -190,6 +190,13 @@ export interface AgyTurnState {
    * output would be dropped whenever both arrive within one poll.
    */
   readonly toolCalls: Map<number, AgyToolCallRecord>;
+  /**
+   * Terminal `tool_call_update`s held back until the transcript record with
+   * that step's output has been streamed. `AcpSessionRuntime` drops its tool
+   * state once a call completes, so output emitted afterwards would surface as
+   * a second, never-completed item.
+   */
+  readonly pendingTerminal: Map<number, AgySessionUpdate>;
   conversationId: string | undefined;
   transcriptPath: string | undefined;
   /** Transcript file pinned for the turn; see `resolveTranscriptPath`. */
@@ -205,6 +212,7 @@ export interface AgyTurnState {
 export function makeAgyTurnState(conversationId?: string): AgyTurnState {
   return {
     toolCalls: new Map(),
+    pendingTerminal: new Map(),
     conversationId,
     transcriptPath: undefined,
     resolvedTranscriptPath: undefined,
