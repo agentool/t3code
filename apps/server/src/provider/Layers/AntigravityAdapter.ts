@@ -402,8 +402,10 @@ export function makeAntigravityAdapter(
           // With approvals enabled the bridge blocks each tool on this callback,
           // so it must be registered before `start()` — the first tool call can
           // arrive as soon as the first turn begins.
-          const pendingApprovals = approvalsByThread.get(input.threadId) ?? new Map();
-          approvalsByThread.set(input.threadId, pendingApprovals);
+          // Not published to `approvalsByThread` yet: if startup fails there is
+          // no session context for teardown to clean up, and repeated failures
+          // across thread ids would grow the map. Registered after `start()`.
+          const pendingApprovals = new Map<ApprovalRequestId, PendingApproval>();
           yield* acp.handleRequestPermission((params) =>
             mapAcpCallbackFailure(
               Effect.gen(function* () {
@@ -494,6 +496,8 @@ export function makeAntigravityAdapter(
             promptsInFlight: 0,
             stopped: false,
           };
+
+          approvalsByThread.set(input.threadId, pendingApprovals);
 
           const nf = yield* Stream.runDrain(
             Stream.mapEffect(acp.getEvents(), (event) =>
@@ -751,9 +755,13 @@ export function makeAntigravityAdapter(
               // believe they own the turn and publish a terminal event each.
               const remaining = Math.max(0, ctx.promptsInFlight - 1);
               ctx.promptsInFlight = remaining;
-              if (remaining > 0 || !turnStarted) {
+              if (remaining > 0) {
                 return;
               }
+              // Cleared even when the turn never started — a model switch can
+              // fail after `activeTurnId` is installed, and leaving it set
+              // advertises a turn to `listSessions` and the reaper that no
+              // longer exists. Only the event below depends on having started.
               if (ctx.activeTurnId === turnId) {
                 ctx.activeTurnId = undefined;
               }
@@ -767,6 +775,9 @@ export function makeAntigravityAdapter(
               // still owes consumers a terminal event; without one the turn
               // renders as running forever even though sendTurn already
               // returned an error.
+              if (!turnStarted) {
+                return;
+              }
               const state = !promptSucceeded
                 ? "failed"
                 : stopReason === "cancelled"
@@ -788,6 +799,17 @@ export function makeAntigravityAdapter(
     const interruptTurn: AntigravityAdapterShape["interruptTurn"] = (threadId) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(threadId);
+        // Settled before the cancel goes out, as ACP requires: an outstanding
+        // permission request has a hook process blocked behind it, and the
+        // bridge turns "cancel" into a denial. Leaving it pending would hold
+        // that tool until the hook's own timeout.
+        const pending = approvalsByThread.get(threadId);
+        if (pending) {
+          for (const [, approval] of pending) {
+            yield* Deferred.succeed(approval.decision, "cancel");
+          }
+          pending.clear();
+        }
         yield* Effect.ignore(
           ctx.acp.cancel.pipe(
             Effect.mapError((error) =>

@@ -130,6 +130,10 @@ export function transcriptRecordUpdates(
   if (typeof stepIndex !== "number") {
     return { updates: [], emittedAssistantText: false };
   }
+  // Recorded before the early returns below: the transcript is read once by
+  // byte offset, so "this step's record has gone by" holds even when it
+  // carried nothing worth emitting.
+  state.transcriptSeenSteps.add(stepIndex);
   // Completed calls stay in the map precisely so this lookup still resolves:
   // a fast tool's `PostToolUse` hook and its transcript record routinely land
   // in the same drain pass, and hooks are read first.

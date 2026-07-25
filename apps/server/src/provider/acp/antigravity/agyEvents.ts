@@ -197,6 +197,13 @@ export interface AgyTurnState {
    * a second, never-completed item.
    */
   readonly pendingTerminal: Map<number, AgySessionUpdate>;
+  /**
+   * Steps whose transcript output has already been streamed. The transcript is
+   * read once by byte offset, so a record consumed before its `PostToolUse`
+   * hook appeared will never be revisited — without this the tool would render
+   * as running until the turn ended.
+   */
+  readonly transcriptSeenSteps: Set<number>;
   conversationId: string | undefined;
   transcriptPath: string | undefined;
   /** Transcript file pinned for the turn; see `resolveTranscriptPath`. */
@@ -213,6 +220,7 @@ export function makeAgyTurnState(conversationId?: string): AgyTurnState {
   return {
     toolCalls: new Map(),
     pendingTerminal: new Map(),
+    transcriptSeenSteps: new Set(),
     conversationId,
     transcriptPath: undefined,
     resolvedTranscriptPath: undefined,

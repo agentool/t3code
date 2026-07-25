@@ -142,6 +142,19 @@ describe("transcriptRecordUpdates", () => {
     });
   });
 
+  it("records the steps whose output has been streamed", () => {
+    // The transcript is read once by byte offset, so a step consumed before
+    // its PostToolUse hook appears is never revisited; the bridge uses this to
+    // complete the call immediately instead of waiting for a second record.
+    const state = stateWithActiveTool(3);
+    transcriptRecordUpdates(
+      { step_index: 3, source: "MODEL", type: "RUN_COMMAND", content: "Created At: x\nok" },
+      state,
+    );
+
+    expect(state.transcriptSeenSteps.has(3)).toBe(true);
+  });
+
   it("drops tool output with no announced call rather than inventing one", () => {
     const result = transcriptRecordUpdates(
       { step_index: 99, source: "MODEL", type: "RUN_COMMAND", content: "orphan" },

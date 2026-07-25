@@ -186,11 +186,21 @@ const pendingOutbound = new Map<
   { readonly resolve: (value: unknown) => void; readonly reject: (error: Error) => void }
 >();
 
-function sendRequest(method: string, params: unknown): Promise<unknown> {
+function sendRequest(method: string, params: unknown, timeoutMs?: number): Promise<unknown> {
   const id = nextOutboundId;
   nextOutboundId += 1;
   return new Promise((resolve, reject) => {
     pendingOutbound.set(id, { resolve, reject });
+    if (timeoutMs !== undefined) {
+      // A client that never answers would otherwise pin this entry for the
+      // life of the bridge process.
+      const timer = setTimeout(() => {
+        if (pendingOutbound.delete(id)) {
+          reject(new Error(`${method} timed out`));
+        }
+      }, timeoutMs);
+      timer.unref?.();
+    }
     writeMessage({ jsonrpc: "2.0", id, method, params });
   });
 }
@@ -351,21 +361,25 @@ function requestToolApproval(input: {
 }): void {
   const toolCall = input.payload.toolCall;
   const stepIdx = typeof input.payload.stepIdx === "number" ? input.payload.stepIdx : 0;
-  void sendRequest("session/request_permission", {
-    sessionId: input.sessionId,
-    toolCall: {
-      toolCallId: agyToolCallId(input.payload.conversationId, stepIdx),
-      title: agyToolTitle(toolCall),
-      kind: agyToolKind(toolCall?.name),
-      status: "pending",
-      rawInput: toolCall?.args ?? null,
-      ...(agyTargetPath(toolCall) ? { locations: [{ path: agyTargetPath(toolCall) }] } : {}),
+  void sendRequest(
+    "session/request_permission",
+    {
+      sessionId: input.sessionId,
+      toolCall: {
+        toolCallId: agyToolCallId(input.payload.conversationId, stepIdx),
+        title: agyToolTitle(toolCall),
+        kind: agyToolKind(toolCall?.name),
+        status: "pending",
+        rawInput: toolCall?.args ?? null,
+        ...(agyTargetPath(toolCall) ? { locations: [{ path: agyTargetPath(toolCall) }] } : {}),
+      },
+      options: [
+        { optionId: APPROVE_OPTION, name: "Allow", kind: "allow_once" },
+        { optionId: REJECT_OPTION, name: "Reject", kind: "reject_once" },
+      ],
     },
-    options: [
-      { optionId: APPROVE_OPTION, name: "Allow", kind: "allow_once" },
-      { optionId: REJECT_OPTION, name: "Reject", kind: "reject_once" },
-    ],
-  })
+    APPROVAL_WAIT_MS,
+  )
     .then((result) => {
       writeDecision(
         input.hookDir,
@@ -412,6 +426,12 @@ export async function runAgyHook(event: string): Promise<void> {
   }
 
   const hookDir = process.env[HOOK_DIR_ENV]?.trim();
+  // When approvals are required this process is a security gate, not an
+  // observer. Any failure below — unparseable payload, unwritable hook
+  // directory, a bridge that never answers — must deny, because the CLI has
+  // already been told to skip its own permission prompts and nothing else
+  // stands between the model and the tool.
+  const gating = Boolean(hookDir) && approvalRequired() && event === "pre-tool-use";
   if (hookDir) {
     try {
       const payload = JSON.parse(raw) as AgyHookPayload;
@@ -433,13 +453,23 @@ export async function runAgyHook(event: string): Promise<void> {
       // With approvals on, this process is the gate: block until the bridge
       // reports the user's answer. `deny` here genuinely stops the tool —
       // Antigravity reports the reason back to the model.
-      if (approvalRequired() && event === "pre-tool-use" && payload?.toolCall) {
+      if (gating && payload?.toolCall) {
         const decision = await awaitDecision(hookDir, name);
         process.stdout.write(JSON.stringify(decision));
         return;
       }
     } catch {
-      // Observation is best-effort: a hook must never break a tool call.
+      // Observation is best-effort: a hook must never break a tool call —
+      // unless it is the approval gate, handled below.
+      if (gating) {
+        process.stdout.write(
+          JSON.stringify({
+            decision: "deny",
+            reason: "T3 Code could not record this tool call for approval",
+          } satisfies AgyHookDecision),
+        );
+        return;
+      }
     }
   }
 
@@ -612,6 +642,22 @@ function stageAttachments(attachments: ReadonlyArray<PromptAttachment>): {
   }
   const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-agy-attach-"));
   const staged: Array<PromptAttachment> = [];
+  try {
+    stageInto(dir, attachments, staged);
+  } catch (error) {
+    // Copies that already succeeded are user uploads; leaving them in /tmp
+    // because a later one failed would outlive the turn that needed them.
+    cleanupDir(dir);
+    throw error;
+  }
+  return { dir, staged };
+}
+
+function stageInto(
+  dir: string,
+  attachments: ReadonlyArray<PromptAttachment>,
+  staged: Array<PromptAttachment>,
+): void {
   attachments.forEach((attachment, index) => {
     // Index-prefixed and sanitised so two attachments sharing a basename cannot
     // collide and a crafted name cannot escape the staging directory.
@@ -623,7 +669,6 @@ function stageAttachments(attachments: ReadonlyArray<PromptAttachment>): {
     NodeFS.copyFileSync(attachment.path, target);
     staged.push({ path: target, name: safeName, mimeType: attachment.mimeType });
   });
-  return { dir, staged };
 }
 
 function composePromptText(
@@ -651,6 +696,23 @@ let activeChild: NodeChildProcess.ChildProcess | null = null;
 /** Session whose turn is currently running, if any. Gates `session/cancel`. */
 let activeTurnSessionId: string | null = null;
 const cancelledSessions = new Set<string>();
+/**
+ * Cancels seen per session, counted rather than flagged.
+ *
+ * A prompt records this value when it is queued. If the count has moved by the
+ * time the prompt reaches the front, a cancel arrived while it waited and the
+ * prompt must not run — turns are serialized, so a steer queued behind a long
+ * turn would otherwise start executing tools after the user pressed Stop. A
+ * counter rather than a flag is what keeps this from also swallowing a cancel
+ * that lands harmlessly between two turns.
+ */
+const cancelGenerations = new Map<string, number>();
+/** Cancel generation captured when each queued prompt was accepted, by JSON-RPC id. */
+const queuedPromptGenerations = new Map<unknown, number>();
+
+function cancelGeneration(sessionId: string): number {
+  return cancelGenerations.get(sessionId) ?? 0;
+}
 
 /**
  * Drain everything Antigravity has produced so far and emit it as ACP updates.
@@ -677,10 +739,16 @@ function drain(input: {
     const update = hookSessionUpdate(hook, input.state, fileText);
     if (update) {
       const stepIdx = hook.payload?.stepIdx;
-      if (hook.event === "post-tool-use" && typeof stepIdx === "number") {
+      if (
+        hook.event === "post-tool-use" &&
+        typeof stepIdx === "number" &&
+        !input.state.transcriptSeenSteps.has(stepIdx)
+      ) {
         // Held back rather than sent: the transcript record carrying this
         // step's real output is usually read later in this same pass, and a
-        // completed call can no longer take content.
+        // completed call can no longer take content. Once that record has been
+        // seen there is nothing left to wait for — and nothing to wait on,
+        // since the transcript is read once by byte offset.
         input.state.pendingTerminal.set(stepIdx, update);
       } else {
         sendSessionUpdate(input.sessionId, update);
@@ -688,7 +756,14 @@ function drain(input: {
     }
     // The hook process is blocked until a decision file appears, so this has
     // to be started for every announced tool call.
-    if (approvalRequired() && hook.event === "pre-tool-use" && hook.payload?.toolCall) {
+    // Not during the final drain: the child has already exited, so no tool is
+    // waiting on the answer and the request would never be settled.
+    if (
+      !input.final &&
+      approvalRequired() &&
+      hook.event === "pre-tool-use" &&
+      hook.payload?.toolCall
+    ) {
       requestToolApproval({
         sessionId: input.sessionId,
         hookDir: input.hookDir,
@@ -1033,6 +1108,13 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
         sendError(id, -32602, "unknown sessionId");
         return;
       }
+      const queuedAt = queuedPromptGenerations.get(id);
+      queuedPromptGenerations.delete(id);
+      if (queuedAt !== undefined && queuedAt !== cancelGeneration(sessionId)) {
+        // Cancelled while it sat in the queue; never spawn `agy` for it.
+        sendResult(id, { stopReason: "cancelled" });
+        return;
+      }
       const prompt = renderPrompt(session, params["prompt"]);
       if (prompt === null) {
         sendError(id, -32602, "session/prompt requires at least one text block");
@@ -1048,13 +1130,18 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
     }
     case "session/cancel": {
       const sessionId = typeof params["sessionId"] === "string" ? params["sessionId"] : undefined;
-      // Only a cancel aimed at the turn actually running can decide its stop
-      // reason. Cancels bypass the request queue, so one that arrives after a
-      // turn has already finished — or targets an idle session — would
-      // otherwise sit in the set and mark the next successful turn cancelled.
-      if (sessionId && sessionId === activeTurnSessionId) {
-        cancelledSessions.add(sessionId);
-        activeChild?.kill("SIGTERM");
+      if (sessionId) {
+        // Always recorded, so prompts already queued for this session can see
+        // that a cancel happened and refuse to start.
+        cancelGenerations.set(sessionId, cancelGeneration(sessionId) + 1);
+        // Only a cancel aimed at the turn actually running decides its stop
+        // reason. Cancels bypass the request queue, so one arriving after a
+        // turn finished — or targeting an idle session — must not sit in the
+        // set and mark the next successful turn cancelled.
+        if (sessionId === activeTurnSessionId) {
+          cancelledSessions.add(sessionId);
+          activeChild?.kill("SIGTERM");
+        }
       }
       return;
     }
@@ -1111,6 +1198,14 @@ export async function runAgyBridge(): Promise<void> {
         continue;
       }
       const pending = message;
+      // Captured now, not when the turn starts: the gap between the two is
+      // exactly the window a cancel has to arrive in while this prompt waits.
+      if (pending["method"] === "session/prompt") {
+        const target = (pending["params"] as Record<string, unknown> | undefined)?.["sessionId"];
+        if (typeof target === "string" && pending["id"] !== undefined) {
+          queuedPromptGenerations.set(pending["id"], cancelGeneration(target));
+        }
+      }
       queue = queue
         .then(() => handleRequest(pending))
         .catch((error: unknown) => {
