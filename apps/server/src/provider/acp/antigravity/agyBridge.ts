@@ -19,6 +19,7 @@ import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
 
 import packageJson from "../../../../package.json" with { type: "json" };
 import {
@@ -34,6 +35,7 @@ import {
 } from "./agyEvents.ts";
 import {
   AgyTranscriptCursor,
+  dropPriorTurnRecords,
   parseTranscriptLine,
   transcriptRecordUpdates,
 } from "./agyTranscript.ts";
@@ -47,6 +49,14 @@ interface BridgeSession {
   readonly cwd: string;
   systemPrompt: string | undefined;
   conversationId: string | undefined;
+  /**
+   * Model and effort for the next turn. Seeded from the spawn environment and
+   * replaced by `session/set_model`; both are command-line flags on every
+   * spawn, so a change takes effect on the following turn without disturbing
+   * the conversation it resumes.
+   */
+  model: string | undefined;
+  effort: string | undefined;
 }
 
 const sessions = new Map<string, BridgeSession>();
@@ -68,7 +78,19 @@ function stateFilePath(): string {
 function readSessionMap(): Record<string, string> {
   try {
     const parsed: unknown = JSON.parse(NodeFS.readFileSync(stateFilePath(), "utf8"));
-    return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, string>) : {};
+    if (typeof parsed !== "object" || parsed === null) {
+      return {};
+    }
+    // The bridge does not exclusively own this file, so entries are validated
+    // rather than cast. A non-string value reaching a caller would throw and
+    // leave the request it came from unanswered.
+    const map: Record<string, string> = {};
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof value === "string") {
+        map[key] = value;
+      }
+    }
+    return map;
   } catch {
     return {};
   }
@@ -83,7 +105,14 @@ function persistConversationId(sessionId: string, conversationId: string): void 
       return;
     }
     map[sessionId] = conversationId;
-    NodeFS.writeFileSync(target, JSON.stringify(map, null, 2));
+    // Written through a uniquely-named temp file and renamed into place. The
+    // map is now the sole resume authority and several bridge processes can
+    // finish turns at once; a partial write would be read back as empty JSON
+    // and silently start a fresh conversation. Rename is atomic within a
+    // filesystem, so a reader sees either the old file or the complete new one.
+    const staging = `${target}.${process.pid}.${NodeCrypto.randomUUID()}.tmp`;
+    NodeFS.writeFileSync(staging, JSON.stringify(map, null, 2));
+    NodeFS.renameSync(staging, target);
   } catch {
     // Losing the mapping costs conversation continuity on the next resume,
     // which is not worth failing a turn over.
@@ -259,21 +288,25 @@ export async function runAgyHook(event: string): Promise<void> {
 
 // ── Turn execution ────────────────────────────────────────────────────
 
-function buildAgyArgs(
-  session: BridgeSession,
-  hookWorkspace: string,
-  prompt: string,
-): Array<string> {
+function buildAgyArgs(input: {
+  readonly session: BridgeSession;
+  readonly hookWorkspace: string;
+  readonly attachmentDir: string | undefined;
+  readonly promptText: string;
+}): Array<string> {
+  const { session, hookWorkspace, attachmentDir } = input;
   const args = [
     "--dangerously-skip-permissions",
     "--print-timeout",
     process.env["T3_AGY_PRINT_TIMEOUT"]?.trim() || DEFAULT_PRINT_TIMEOUT,
   ];
-  const model = process.env["T3_AGY_MODEL"]?.trim();
+  // Per session, not per process: `--model` applies to the turn being spawned
+  // and composes with `--conversation`, so the trajectory survives a switch.
+  const model = session.model?.trim();
   if (model) {
     args.push("--model", model);
   }
-  const effort = process.env["T3_AGY_EFFORT"]?.trim();
+  const effort = session.effort?.trim();
   if (effort) {
     args.push("--effort", effort);
   }
@@ -284,29 +317,127 @@ function buildAgyArgs(
   // session workspace is registered so its `.agents` skills and rules load;
   // the hook workspace is registered so the observer attaches.
   args.push("--add-dir", session.cwd, "--add-dir", hookWorkspace);
-  args.push("--print", prompt);
+  if (attachmentDir) {
+    args.push("--add-dir", attachmentDir);
+  }
+  args.push("--print", input.promptText);
   return args;
 }
 
-function renderPrompt(session: BridgeSession, promptBlocks: unknown): string | null {
+/** A local file referenced by a `resource_link` prompt block. */
+interface PromptAttachment {
+  readonly path: string;
+  readonly name: string;
+  readonly mimeType: string | undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+/**
+ * Extract local files from `resource_link` blocks.
+ *
+ * Only `file:` URIs are taken: a remote URL is left in the prompt text for the
+ * agent's own fetch tool, and passing one to `--add-dir` would be meaningless.
+ */
+function collectAttachments(promptBlocks: ReadonlyArray<unknown>): ReadonlyArray<PromptAttachment> {
+  const attachments: Array<PromptAttachment> = [];
+  for (const block of promptBlocks) {
+    if (!isRecord(block) || block["type"] !== "resource_link") {
+      continue;
+    }
+    const uri = block["uri"];
+    if (typeof uri !== "string" || !uri.startsWith("file://")) {
+      continue;
+    }
+    let filePath: string;
+    try {
+      filePath = NodeURL.fileURLToPath(uri);
+    } catch {
+      continue;
+    }
+    const name = typeof block["name"] === "string" ? block["name"] : NodePath.basename(filePath);
+    attachments.push({
+      path: filePath,
+      name,
+      mimeType: typeof block["mimeType"] === "string" ? block["mimeType"] : undefined,
+    });
+  }
+  return attachments;
+}
+
+interface RenderedPrompt {
+  readonly baseText: string;
+  readonly attachments: ReadonlyArray<PromptAttachment>;
+}
+
+function renderPrompt(session: BridgeSession, promptBlocks: unknown): RenderedPrompt | null {
   if (!Array.isArray(promptBlocks)) {
     return null;
   }
   const text = promptBlocks
     .filter(
       (block): block is { type: string; text: string } =>
-        typeof block === "object" &&
-        block !== null &&
-        (block as { type?: unknown }).type === "text" &&
-        typeof (block as { text?: unknown }).text === "string",
+        isRecord(block) && block["type"] === "text" && typeof block["text"] === "string",
     )
     .map((block) => block.text)
-    .join("\n\n");
-  if (text.trim().length === 0) {
+    .join("\n\n")
+    .trim();
+
+  const attachments = collectAttachments(promptBlocks);
+  if (text.length === 0 && attachments.length === 0) {
     return null;
   }
+
   const systemPrompt = session.systemPrompt?.trim();
-  return systemPrompt ? `System instructions:\n${systemPrompt}\n\nRequest:\n${text}` : text;
+  return {
+    baseText: systemPrompt ? `System instructions:\n${systemPrompt}\n\nRequest:\n${text}` : text,
+    attachments,
+  };
+}
+
+/**
+ * Copy this turn's attachments into a throwaway directory.
+ *
+ * `agy --print` has no attachment flag, so files must be named by path with
+ * their directory registered via `--add-dir`. Registering the attachment store
+ * itself would hand an auto-approving agent read access to every thread's
+ * uploads, so only the files this turn references are staged, and the staging
+ * directory dies with the turn.
+ */
+function stageAttachments(attachments: ReadonlyArray<PromptAttachment>): {
+  readonly dir: string | undefined;
+  readonly staged: ReadonlyArray<PromptAttachment>;
+} {
+  if (attachments.length === 0) {
+    return { dir: undefined, staged: [] };
+  }
+  const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-agy-attach-"));
+  const staged: Array<PromptAttachment> = [];
+  attachments.forEach((attachment, index) => {
+    // Index-prefixed and sanitised so two attachments sharing a basename cannot
+    // collide and a crafted name cannot escape the staging directory.
+    const safeName = `${index}-${NodePath.basename(attachment.name).replace(/[^\w.-]+/g, "_")}`;
+    const target = NodePath.join(dir, safeName);
+    try {
+      NodeFS.copyFileSync(attachment.path, target);
+    } catch {
+      // An unreadable attachment is dropped rather than failing the whole turn.
+      return;
+    }
+    staged.push({ path: target, name: safeName, mimeType: attachment.mimeType });
+  });
+  return { dir, staged };
+}
+
+function composePromptText(baseText: string, staged: ReadonlyArray<PromptAttachment>): string {
+  if (staged.length === 0) {
+    return baseText;
+  }
+  const list = staged.map((a) => `- ${a.path}${a.mimeType ? ` (${a.mimeType})` : ""}`).join("\n");
+  const block = `Attached files (read them from these paths):\n${list}`;
+  return baseText.length > 0 ? `${baseText}\n\n${block}` : block;
 }
 
 interface TurnOutcome {
@@ -369,7 +500,13 @@ function drain(input: {
     }
 
     const lines = chunk.length > 0 ? input.cursor.push(chunk) : [];
-    const allLines = input.final ? [...lines, ...input.cursor.flush()] : lines;
+    let allLines = input.final ? [...lines, ...input.cursor.flush()] : lines;
+    // Reading always starts at byte 0, so the first batch of a resumed
+    // conversation carries every prior turn. Trim once, then stream.
+    if (!input.state.transcriptPrimed && allLines.length > 0) {
+      allLines = [...dropPriorTurnRecords(allLines)];
+      input.state.transcriptPrimed = true;
+    }
     for (const line of allLines) {
       const record = parseTranscriptLine(line);
       if (!record) {
@@ -413,26 +550,59 @@ function resolveTranscriptPath(state: AgyTurnState): string | undefined {
 async function runTurn(
   sessionId: string,
   session: BridgeSession,
-  prompt: string,
+  prompt: RenderedPrompt,
 ): Promise<TurnOutcome> {
   // A cancel that raced the end of an earlier turn must not decide this one.
   cancelledSessions.delete(sessionId);
-  const hookDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-agy-hookout-"));
-  const hookWorkspace = createHookWorkspace();
-  const command = process.env["T3_AGY_COMMAND"]?.trim() || "agy";
+  // Claimed before any setup work: spawning `agy` takes long enough that a
+  // cancel can land first, and cancels are only honoured for the session
+  // holding this claim. Leaving it unset until after the spawn would silently
+  // drop those, letting an auto-approving child run on past a cancelled turn.
+  activeTurnSessionId = sessionId;
+  let hookDir: string | undefined;
+  let hookWorkspace: string | undefined;
+  let attachmentDir: string | undefined;
+  let child: NodeChildProcess.ChildProcess;
+  try {
+    hookDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-agy-hookout-"));
+    hookWorkspace = createHookWorkspace();
+    const attachments = stageAttachments(prompt.attachments);
+    attachmentDir = attachments.dir;
+    const command = process.env["T3_AGY_COMMAND"]?.trim() || "agy";
+    child = NodeChildProcess.spawn(
+      command,
+      buildAgyArgs({
+        session,
+        hookWorkspace,
+        attachmentDir,
+        promptText: composePromptText(prompt.baseText, attachments.staged),
+      }),
+      {
+        cwd: session.cwd,
+        env: { ...process.env, [HOOK_DIR_ENV]: hookDir },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+  } catch (error) {
+    // Setup failed, so no turn is running: release the claim and reclaim the
+    // directories, or repeated failures would leak one set each time.
+    activeTurnSessionId = null;
+    cleanupDir(hookDir);
+    cleanupDir(hookWorkspace);
+    cleanupDir(attachmentDir);
+    throw error;
+  }
+
   const state = makeAgyTurnState(session.conversationId);
   const seenHooks = new Set<string>();
   const cursor = new AgyTranscriptCursor();
   const transcriptOffset = { value: 0 };
   const assistantText = { emitted: false };
-
-  const child = NodeChildProcess.spawn(command, buildAgyArgs(session, hookWorkspace, prompt), {
-    cwd: session.cwd,
-    env: { ...process.env, [HOOK_DIR_ENV]: hookDir },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
   activeChild = child;
-  activeTurnSessionId = sessionId;
+  // A cancel during startup had no process to signal; deliver it now.
+  if (cancelledSessions.has(sessionId)) {
+    child.kill("SIGTERM");
+  }
 
   let stdout = "";
   let stderr = "";
@@ -498,6 +668,7 @@ async function runTurn(
 
   cleanupDir(hookDir);
   cleanupDir(hookWorkspace);
+  cleanupDir(attachmentDir);
 
   if (cancelledSessions.delete(sessionId)) {
     return { stopReason: "cancelled" };
@@ -519,7 +690,10 @@ async function runTurn(
   return { stopReason: "end_turn" };
 }
 
-function cleanupDir(dir: string): void {
+function cleanupDir(dir: string | undefined): void {
+  if (!dir) {
+    return;
+  }
   try {
     NodeFS.rmSync(dir, { recursive: true, force: true });
   } catch {
@@ -546,6 +720,8 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
         protocolVersion: Math.min(requested, 1),
         agentCapabilities: {
           loadSession: true,
+          // Images ride in as `resource_link` blocks (an ACP baseline type)
+          // rather than inline base64, so the `image` capability stays off.
           promptCapabilities: { image: false, audio: false, embeddedContext: false },
           mcpCapabilities: { http: false, sse: false },
         },
@@ -582,8 +758,28 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
         systemPrompt:
           typeof params["systemPrompt"] === "string" ? params["systemPrompt"] : undefined,
         conversationId: requestedSessionId ? lookupConversationId(requestedSessionId) : undefined,
+        model: process.env["T3_AGY_MODEL"]?.trim() || undefined,
+        effort: process.env["T3_AGY_EFFORT"]?.trim() || undefined,
       });
       sendResult(id, method === "session/load" ? {} : { sessionId });
+      return;
+    }
+    // `--model` is a per-spawn flag that composes with `--conversation`, so a
+    // switch applies from the next turn while the trajectory carries over.
+    case "session/set_model": {
+      const sessionId = typeof params["sessionId"] === "string" ? params["sessionId"] : undefined;
+      const session = sessionId ? sessions.get(sessionId) : undefined;
+      if (!session) {
+        sendError(id, -32602, "unknown sessionId");
+        return;
+      }
+      const modelId = typeof params["modelId"] === "string" ? params["modelId"].trim() : "";
+      if (modelId.length === 0) {
+        sendError(id, -32602, "session/set_model requires a modelId");
+        return;
+      }
+      session.model = modelId;
+      sendResult(id, {});
       return;
     }
     case "session/prompt": {
@@ -663,7 +859,17 @@ export async function runAgyBridge(): Promise<void> {
         void handleRequest(message);
         continue;
       }
-      queue = queue.then(() => handleRequest(message)).catch(() => undefined);
+      const pending = message;
+      queue = queue
+        .then(() => handleRequest(pending))
+        .catch((error: unknown) => {
+          // Every request must be answered. Swallowing a handler failure would
+          // leave the client blocked on a response that never arrives.
+          if (pending["id"] !== undefined) {
+            const detail = error instanceof Error ? error.message : String(error);
+            sendError(pending["id"], -32603, `internal bridge error: ${detail}`);
+          }
+        });
     }
   }
 

@@ -194,6 +194,11 @@ export interface AgyTurnState {
   transcriptPath: string | undefined;
   /** Transcript file pinned for the turn; see `resolveTranscriptPath`. */
   resolvedTranscriptPath: string | undefined;
+  /**
+   * Whether records predating this turn have been discarded. Reading starts at
+   * byte 0, which on a resumed conversation is the start of the whole history.
+   */
+  transcriptPrimed: boolean;
   modelName: string | undefined;
 }
 
@@ -203,6 +208,7 @@ export function makeAgyTurnState(conversationId?: string): AgyTurnState {
     conversationId,
     transcriptPath: undefined,
     resolvedTranscriptPath: undefined,
+    transcriptPrimed: false,
     modelName: undefined,
   };
 }

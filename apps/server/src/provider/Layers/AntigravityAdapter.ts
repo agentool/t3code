@@ -9,9 +9,12 @@
  *     `--dangerously-skip-permissions` because print mode cannot prompt, so
  *     tools are auto-approved and no approval flow can be surfaced.
  *   - **No session modes.** Print mode has no plan/ask distinction to switch.
- *   - **Model is fixed per session.** The bridge passes `--model` when it
- *     spawns `agy`, so changing models requires a new session
- *     (`sessionModelSwitch: "unsupported"`).
+ *   - **Attachments travel by reference.** `agy --print` has no attachment
+ *     flag, so files are sent as `resource_link` blocks and the bridge stages
+ *     them into a directory it grants the CLI access to for that turn.
+ *   - **Model changes apply from the next turn.** `--model` is a per-spawn
+ *     flag that composes with `--conversation`, so a switch keeps the
+ *     trajectory rather than needing a new session.
  *
  * @module AntigravityAdapterLive
  */
@@ -42,6 +45,8 @@ import * as SynchronizedRef from "effect/SynchronizedRef";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import type * as EffectAcpSchema from "effect-acp/schema";
 
+import { attachmentFileUrl, resolveAttachmentPath } from "../../attachmentStore.ts";
+import { ServerConfig } from "../../config.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import {
   ProviderAdapterProcessError,
@@ -93,6 +98,8 @@ interface AntigravitySessionContext {
   notificationFiber: Fiber.Fiber<void, never> | undefined;
   readonly turns: Array<{ id: TurnId; items: Array<unknown> }>;
   activeTurnId: TurnId | undefined;
+  /** Model the bridge will pass to `agy --model` on the next turn. */
+  currentModelId: string | undefined;
   /**
    * Number of prompts in flight. >0 means a turn is running, so a new
    * sendTurn steers the existing turn rather than opening a new one.
@@ -135,6 +142,7 @@ export function makeAntigravityAdapter(
 ) {
   return Effect.gen(function* () {
     const boundInstanceId = options?.instanceId ?? ProviderInstanceId.make("antigravity");
+    const serverConfig = yield* Effect.service(ServerConfig);
     const path = yield* Path.Path;
     const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const crypto = yield* Crypto.Crypto;
@@ -362,6 +370,7 @@ export function makeAntigravityAdapter(
             notificationFiber: undefined,
             turns: [],
             activeTurnId: undefined,
+            currentModelId: boundModel,
             promptsInFlight: 0,
             stopped: false,
           };
@@ -486,20 +495,50 @@ export function makeAntigravityAdapter(
       Effect.gen(function* () {
         const ctx = yield* requireSession(input.threadId);
 
-        // The bridge declares no image capability: `agy --print` takes text
-        // only, so attachments cannot be forwarded. This runs before any
-        // `turn.started` is offered — a rejected prompt that had already
-        // announced a turn would leave the UI with one that never completes.
-        const promptParts: Array<EffectAcpSchema.ContentBlock> = [];
-        if (input.input?.trim()) {
-          promptParts.push({ type: "text", text: input.input.trim() });
-        }
+        // `agy --print` takes a single text prompt, so attachments travel as
+        // `resource_link` blocks (ACP baseline, no capability needed) pointing
+        // at the files the attachment store already wrote to disk. The bridge
+        // renders those paths into the prompt and grants `agy` read access to
+        // stages just those files into a per-turn directory it can grant `agy`
+        // access to. Nothing is re-encoded.
+        //
+        // This runs before any `turn.started` is offered — a rejected prompt
+        // that had already announced a turn would leave the UI with one that
+        // never completes.
+        const text = input.input?.trim();
+        const attachmentParts = yield* Effect.forEach(input.attachments ?? [], (attachment) =>
+          Effect.gen(function* () {
+            const attachmentPath = resolveAttachmentPath({
+              attachmentsDir: serverConfig.attachmentsDir,
+              attachment,
+            });
+            if (!attachmentPath) {
+              return yield* new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "session/prompt",
+                detail: `Invalid attachment id '${attachment.id}'.`,
+              });
+            }
+            return {
+              type: "resource_link",
+              // `pathToFileURL` rather than hand-built escaping: it handles
+              // Windows drive letters and escapes `#`/`?`, which would
+              // otherwise truncate the path when the bridge parses it back.
+              uri: attachmentFileUrl(attachmentPath),
+              name: path.basename(attachmentPath),
+              ...(attachment.mimeType ? { mimeType: attachment.mimeType } : {}),
+            } satisfies EffectAcpSchema.ContentBlock;
+          }),
+        );
+        const promptParts: Array<EffectAcpSchema.ContentBlock> = [
+          ...(text ? [{ type: "text" as const, text }] : []),
+          ...attachmentParts,
+        ];
         if (promptParts.length === 0) {
           return yield* new ProviderAdapterValidationError({
             provider: PROVIDER,
             operation: "sendTurn",
-            issue:
-              "Turn requires non-empty text. Antigravity print mode does not accept attachments.",
+            issue: "Turn requires non-empty text or attachments.",
           });
         }
 
@@ -508,6 +547,9 @@ export function makeAntigravityAdapter(
         const steeringTurnId = ctx.promptsInFlight > 0 ? ctx.activeTurnId : undefined;
         const turnId = steeringTurnId ?? TurnId.make(yield* randomUUIDv4);
         ctx.promptsInFlight += 1;
+        // Tracks whether a terminal event was published on the success path, so
+        // the teardown below can tell "already reported" from "died silently".
+        let settled = false;
 
         return yield* Effect.gen(function* () {
           ctx.activeTurnId = turnId;
@@ -526,6 +568,28 @@ export function makeAntigravityAdapter(
               turnId,
               payload: { model: ctx.session.model },
             });
+          }
+
+          // `agy` binds the model with a `--model` flag on each spawn, and that
+          // flag composes with `--conversation` — verified against the CLI: a
+          // resumed conversation answers on the new model with its history
+          // intact. So a switch is applied to the bridge session here and takes
+          // effect on the turn about to run.
+          const turnModelSelection =
+            input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
+          const requestedModelId = turnModelSelection?.model
+            ? resolveAntigravityBaseModelId(turnModelSelection.model)
+            : undefined;
+          if (requestedModelId !== undefined && requestedModelId !== ctx.currentModelId) {
+            yield* ctx.acp
+              .setSessionModel(requestedModelId)
+              .pipe(
+                Effect.mapError((cause) =>
+                  mapAcpToAdapterError(PROVIDER, input.threadId, "session/set_model", cause),
+                ),
+              );
+            ctx.currentModelId = requestedModelId;
+            ctx.session = { ...ctx.session, model: turnModelSelection?.model ?? ctx.session.model };
           }
 
           const result = yield* ctx.acp
@@ -562,6 +626,7 @@ export function makeAntigravityAdapter(
                 stopReason: result.stopReason ?? null,
               },
             });
+            settled = true;
           }
 
           return {
@@ -571,9 +636,34 @@ export function makeAntigravityAdapter(
           };
         }).pipe(
           Effect.ensuring(
-            Effect.sync(() => {
-              ctx.promptsInFlight = Math.max(0, ctx.promptsInFlight - 1);
-            }),
+            Effect.gen(function* () {
+              const remaining = Math.max(0, ctx.promptsInFlight - 1);
+              ctx.promptsInFlight = remaining;
+              // A prompt that failed or was interrupted after `turn.started`
+              // was announced still owes consumers a terminal event; without
+              // one the turn renders as running forever even though sendTurn
+              // has already returned an error.
+              if (settled || remaining > 0) {
+                return;
+              }
+              if (ctx.activeTurnId === turnId) {
+                ctx.activeTurnId = undefined;
+              }
+              // The public session field is what `listSessions` and the reaper
+              // read, so leaving it set would advertise a turn that has ended.
+              if (ctx.session.activeTurnId === turnId) {
+                const { activeTurnId: _endedTurnId, ...endedSession } = ctx.session;
+                ctx.session = { ...endedSession, status: "ready", updatedAt: yield* nowIso };
+              }
+              yield* offerRuntimeEvent({
+                type: "turn.completed",
+                ...(yield* makeEventStamp()),
+                provider: PROVIDER,
+                threadId: input.threadId,
+                turnId,
+                payload: { state: "failed", stopReason: null },
+              });
+            }).pipe(Effect.catch(() => Effect.void)),
           ),
         );
       });
@@ -625,7 +715,7 @@ export function makeAntigravityAdapter(
 
     const rollbackThread: AntigravityAdapterShape["rollbackThread"] = (threadId, numTurns) =>
       Effect.gen(function* () {
-        const ctx = yield* requireSession(threadId);
+        yield* requireSession(threadId);
         if (!Number.isInteger(numTurns) || numTurns < 1) {
           return yield* new ProviderAdapterValidationError({
             provider: PROVIDER,
@@ -633,9 +723,16 @@ export function makeAntigravityAdapter(
             issue: "numTurns must be an integer >= 1.",
           });
         }
-        const nextLength = Math.max(0, ctx.turns.length - numTurns);
-        ctx.turns.splice(nextLength);
-        return { threadId, turns: ctx.turns };
+        // Truncating the local turn list would report success while leaving the
+        // Antigravity trajectory untouched: the next turn resumes the same
+        // `--conversation` and still sees the rolled-back exchanges, so the
+        // model would answer from history the user believes is gone. Print mode
+        // exposes no rewind primitive, so this fails loudly instead.
+        return yield* new ProviderAdapterRequestError({
+          provider: PROVIDER,
+          method: "thread/rollback",
+          detail: "Antigravity conversations do not support provider-side rollback.",
+        });
       });
 
     const stopSession: AntigravityAdapterShape["stopSession"] = (threadId) =>
@@ -675,7 +772,7 @@ export function makeAntigravityAdapter(
       provider: PROVIDER,
       // `agy --model` is applied when the bridge spawns the CLI, so switching
       // models mid-session is not possible.
-      capabilities: { sessionModelSwitch: "unsupported" },
+      capabilities: { sessionModelSwitch: "in-session" },
       startSession,
       sendTurn,
       interruptTurn,

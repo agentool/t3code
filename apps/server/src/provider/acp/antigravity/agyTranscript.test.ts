@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { hookSessionUpdate, makeAgyTurnState, type AgyTurnState } from "./agyEvents.ts";
 import {
   AgyTranscriptCursor,
+  dropPriorTurnRecords,
   normalizeToolOutput,
   parseTranscriptLine,
   transcriptRecordUpdates,
@@ -148,6 +149,43 @@ describe("transcriptRecordUpdates", () => {
     );
 
     expect(result.updates).toHaveLength(0);
+  });
+});
+
+describe("dropPriorTurnRecords", () => {
+  const line = (step: number, type: string) => JSON.stringify({ step_index: step, type });
+
+  it("keeps only what follows the last USER_INPUT", () => {
+    // Shape taken from a real two-turn transcript: one append-only file per
+    // conversation, each turn opening with USER_INPUT.
+    const lines = [
+      line(0, "USER_INPUT"),
+      line(1, "CONVERSATION_HISTORY"),
+      line(2, "PLANNER_RESPONSE"),
+      line(3, "LIST_DIRECTORY"),
+      line(4, "CHECKPOINT"),
+      line(5, "PLANNER_RESPONSE"),
+      line(6, "USER_INPUT"),
+      line(7, "SYSTEM_MESSAGE"),
+      line(8, "PLANNER_RESPONSE"),
+    ];
+
+    expect(dropPriorTurnRecords(lines)).toEqual([
+      line(7, "SYSTEM_MESSAGE"),
+      line(8, "PLANNER_RESPONSE"),
+    ]);
+  });
+
+  it("drops this turn's own opening record on a fresh conversation", () => {
+    expect(dropPriorTurnRecords([line(0, "USER_INPUT"), line(1, "PLANNER_RESPONSE")])).toEqual([
+      line(1, "PLANNER_RESPONSE"),
+    ]);
+  });
+
+  it("keeps everything when the opening record has not been written yet", () => {
+    const lines = [line(2, "PLANNER_RESPONSE")];
+    expect(dropPriorTurnRecords(lines)).toEqual(lines);
+    expect(dropPriorTurnRecords([])).toEqual([]);
   });
 });
 

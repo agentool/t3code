@@ -156,6 +156,29 @@ export function transcriptRecordUpdates(
 }
 
 /**
+ * Drop transcript records belonging to earlier turns.
+ *
+ * One conversation keeps a single append-only transcript, and every turn opens
+ * with a `USER_INPUT` record, so the last one in the file marks where the
+ * current turn begins. Resuming a conversation starts reading at byte 0 — the
+ * turn's own records cannot be located any other way — which without this trim
+ * would replay every prior assistant message as new output.
+ *
+ * Applied only to the first batch of a turn. Returns the input unchanged when
+ * no `USER_INPUT` is present, which is the correct read for a transcript whose
+ * opening record has not been written yet.
+ */
+export function dropPriorTurnRecords(lines: ReadonlyArray<string>): ReadonlyArray<string> {
+  let lastUserInput = -1;
+  for (let index = 0; index < lines.length; index += 1) {
+    if (parseTranscriptLine(lines[index] ?? "")?.type === "USER_INPUT") {
+      lastUserInput = index;
+    }
+  }
+  return lastUserInput === -1 ? lines : lines.slice(lastUserInput + 1);
+}
+
+/**
  * Incremental transcript cursor.
  *
  * Tracks a byte offset and holds back a trailing partial line so a record that
