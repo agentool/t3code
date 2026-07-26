@@ -264,6 +264,16 @@ function quoteArg(value: string): string {
  */
 function createHookWorkspace(): string {
   const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-agy-hooks-"));
+  try {
+    return writeHookWorkspace(dir);
+  } catch (error) {
+    // The caller never received the path, so it cannot clean this up itself.
+    cleanupDir(dir);
+    throw error;
+  }
+}
+
+function writeHookWorkspace(dir: string): string {
   const agentsDir = NodePath.join(dir, ".agents");
   NodeFS.mkdirSync(agentsDir, { recursive: true });
   // A gating PreToolUse hook blocks while the user decides, so its timeout has

@@ -81,6 +81,14 @@ import { type AntigravityAdapterShape } from "../Services/AntigravityAdapter.ts"
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 
 const PROVIDER = ProviderDriverKind.make("antigravity");
+/**
+ * How long this side waits for a tool-approval answer.
+ *
+ * Deliberately longer than the bridge's own wait: the bridge denies first and
+ * the blocked hook is released by that, so this only exists to stop an
+ * unanswered request pinning its entry and its UI prompt forever.
+ */
+const APPROVAL_WAIT_MS = 11 * 60 * 1000;
 const ANTIGRAVITY_RESUME_VERSION = 1 as const;
 
 export interface AntigravityAdapterLiveOptions {
@@ -110,6 +118,20 @@ interface AntigravitySessionContext {
   activeTurnId: TurnId | undefined;
   /** Model the bridge will pass to `agy --model` on the next turn. */
   currentModelId: string | undefined;
+  /**
+   * Bumped by every interrupt. A prompt records this when it is accepted and
+   * rechecks it immediately before submitting: the ACP runtime serializes
+   * prompts behind a semaphore, so a steer can still be waiting there when
+   * Stop is pressed and would otherwise reach the bridge *after* the cancel,
+   * capture the post-cancel state, and run anyway.
+   */
+  cancelEpoch: number;
+  /**
+   * Turns for which `turn.started` has actually been published. Shared rather
+   * than per-call, so a steer cannot assume the prompt it folded into already
+   * announced the turn — that prompt may have failed during preflight.
+   */
+  readonly startedTurnIds: Set<TurnId>;
   /**
    * Number of prompts in flight. >0 means a turn is running, so a new
    * sendTurn steers the existing turn rather than opening a new one.
@@ -437,8 +459,18 @@ export function makeAntigravityAdapter(
                     rawPayload: params,
                   }),
                 );
-                const resolved = yield* Deferred.await(decision);
-                pendingApprovals.delete(requestId);
+                // Raced against a deadline and cleaned up unconditionally: the
+                // bridge forgets its side of a timed-out request, so without
+                // this the handler would stay blocked and the entry retained.
+                const answered = yield* Deferred.await(decision).pipe(
+                  Effect.timeoutOption(APPROVAL_WAIT_MS),
+                  Effect.ensuring(Effect.sync(() => pendingApprovals.delete(requestId))),
+                );
+                // An unanswered request denies, matching the bridge's own
+                // timeout: this gate must never resolve to "allow" by default.
+                const resolved: ProviderApprovalDecision = Option.isSome(answered)
+                  ? answered.value
+                  : "cancel";
                 yield* offerRuntimeEvent(
                   makeAcpRequestResolvedEvent({
                     stamp: yield* makeEventStamp(),
@@ -495,11 +527,11 @@ export function makeAntigravityAdapter(
             turns: [],
             activeTurnId: undefined,
             currentModelId: boundModel,
+            cancelEpoch: 0,
+            startedTurnIds: new Set(),
             promptsInFlight: 0,
             stopped: false,
           };
-
-          approvalsByThread.set(input.threadId, pendingApprovals);
 
           const nf = yield* Stream.runDrain(
             Stream.mapEffect(acp.getEvents(), (event) =>
@@ -589,6 +621,10 @@ export function makeAntigravityAdapter(
 
           ctx.notificationFiber = nf;
           sessions.set(input.threadId, ctx);
+          // Published only now: teardown finds pending approvals through the
+          // session context, so registering earlier would leak the entry if
+          // startup were interrupted before the session existed.
+          approvalsByThread.set(input.threadId, pendingApprovals);
           sessionScopeTransferred = true;
 
           yield* offerRuntimeEvent({
@@ -679,10 +715,11 @@ export function makeAntigravityAdapter(
         const freshTurnId = TurnId.make(yield* randomUUIDv4);
         const steeringTurnId = ctx.promptsInFlight > 0 ? ctx.activeTurnId : undefined;
         const turnId = steeringTurnId ?? freshTurnId;
+        const acceptedEpoch = ctx.cancelEpoch;
         ctx.promptsInFlight += 1;
         // Terminal-event bookkeeping. Publication happens in exactly one place
         // (the teardown below) so that the decision cannot race a steer.
-        let turnStarted = steeringTurnId !== undefined;
+        let turnStarted = false;
         let stopReason: string | null = null;
         let promptSucceeded = false;
 
@@ -716,7 +753,11 @@ export function makeAntigravityAdapter(
             ctx.session = { ...ctx.session, model: turnModelSelection?.model ?? ctx.session.model };
           }
 
-          if (steeringTurnId === undefined) {
+          // Claimed from shared state, not from "am I a steer": the prompt this
+          // one folded into may have failed before it announced anything, and
+          // emitting content for a turn that never started strands the UI.
+          if (!ctx.startedTurnIds.has(turnId)) {
+            ctx.startedTurnIds.add(turnId);
             yield* offerRuntimeEvent({
               type: "turn.started",
               ...(yield* makeEventStamp()),
@@ -725,7 +766,19 @@ export function makeAntigravityAdapter(
               turnId,
               payload: { model: ctx.session.model },
             });
-            turnStarted = true;
+          }
+          turnStarted = ctx.startedTurnIds.has(turnId);
+
+          // Rechecked here rather than only at accept time: everything above
+          // yields, and an interrupt during any of it means this prompt must
+          // not reach the agent.
+          if (ctx.cancelEpoch !== acceptedEpoch) {
+            stopReason = "cancelled";
+            return {
+              threadId: input.threadId,
+              turnId,
+              resumeCursor: ctx.session.resumeCursor,
+            };
           }
 
           const result = yield* ctx.acp
@@ -774,6 +827,7 @@ export function makeAntigravityAdapter(
               if (ctx.activeTurnId === turnId) {
                 ctx.activeTurnId = undefined;
               }
+              ctx.startedTurnIds.delete(turnId);
               // The public session field is what `listSessions` and the reaper
               // read, so leaving it set would advertise a turn that has ended.
               if (ctx.session.activeTurnId === turnId) {
@@ -787,11 +841,8 @@ export function makeAntigravityAdapter(
               if (!turnStarted) {
                 return;
               }
-              const state = !promptSucceeded
-                ? "failed"
-                : stopReason === "cancelled"
-                  ? "cancelled"
-                  : "completed";
+              const state =
+                stopReason === "cancelled" ? "cancelled" : promptSucceeded ? "completed" : "failed";
               yield* offerRuntimeEvent({
                 type: "turn.completed",
                 ...(yield* makeEventStamp()),
@@ -811,6 +862,9 @@ export function makeAntigravityAdapter(
     const interruptTurn: AntigravityAdapterShape["interruptTurn"] = (threadId) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(threadId);
+        // Recorded before anything else: prompts already accepted but still
+        // queued upstream compare against this and refuse to submit.
+        ctx.cancelEpoch += 1;
         // Settled before the cancel goes out, as ACP requires: an outstanding
         // permission request has a hook process blocked behind it, and the
         // bridge turns "cancel" into a denial. Leaving it pending would hold
