@@ -84,6 +84,44 @@ const sessions = new Map<string, BridgeSession>();
 // `session/load` — potentially in a fresh bridge process — can still resume
 // the right conversation.
 
+/**
+ * Where Antigravity keeps a conversation's trajectory.
+ *
+ * Layout confirmed against real conversations:
+ * `<appDataDir>/brain/<conversation-uuid>/.system_generated/logs/`.
+ */
+function transcriptDirFor(conversationId: string): string {
+  const appDataDir =
+    process.env["T3_AGY_APP_DATA_DIR"]?.trim() ||
+    NodePath.join(NodeOS.homedir(), ".gemini", "antigravity-cli");
+  return NodePath.join(appDataDir, "brain", conversationId, ".system_generated", "logs");
+}
+
+/**
+ * Bytes already in a resumed conversation's transcript before this turn runs.
+ *
+ * A positive baseline, taken before `agy` is spawned, is what makes "records
+ * from earlier turns" precise. Inferring the boundary from the last
+ * `USER_INPUT` record cannot: the file always contains previous ones, so a
+ * poll landing before the new marker is written would treat an earlier turn's
+ * output as live. Returns 0 when the file cannot be measured, which falls back
+ * to the marker heuristic rather than skipping the turn's own output.
+ */
+function transcriptBaseline(conversationId: string | undefined): number {
+  if (!conversationId) {
+    return 0;
+  }
+  const dir = transcriptDirFor(conversationId);
+  for (const name of ["transcript.jsonl", "transcript_full.jsonl"]) {
+    try {
+      return NodeFS.statSync(NodePath.join(dir, name)).size;
+    } catch {
+      // Try the sibling, then give up.
+    }
+  }
+  return 0;
+}
+
 function stateDirPath(): string {
   const appDataDir =
     process.env["T3_AGY_APP_DATA_DIR"]?.trim() ||
@@ -489,8 +527,16 @@ export async function runAgyHook(event: string): Promise<void> {
       // With approvals on, this process is the gate: block until the bridge
       // reports the user's answer. `deny` here genuinely stops the tool —
       // Antigravity reports the reason back to the model.
-      if (gating && payload?.toolCall) {
-        const decision = await awaitDecision(hookDir, name);
+      if (gating) {
+        // Every gating path answers here. A payload without `toolCall` used to
+        // fall through to the observation-only response, which allows — so a
+        // change in Antigravity's payload shape would have run tools unapproved.
+        const decision = payload?.toolCall
+          ? await awaitDecision(hookDir, name)
+          : ({
+              decision: "deny",
+              reason: "T3 Code could not identify this tool call for approval",
+            } satisfies AgyHookDecision);
         process.stdout.write(JSON.stringify(decision));
         return;
       }
@@ -929,6 +975,9 @@ async function runTurn(
   // holding this claim. Leaving it unset until after the spawn would silently
   // drop those, letting an auto-approving child run on past a cancelled turn.
   activeTurnSessionId = sessionId;
+  // Measured before `agy` starts: whatever the transcript already holds
+  // belongs to earlier turns of the conversation being resumed.
+  const baseline = transcriptBaseline(session.conversationId);
   let hookDir: string | undefined;
   let hookWorkspace: string | undefined;
   let attachmentDir: string | undefined;
@@ -967,7 +1016,12 @@ async function runTurn(
   const seenHooks = new Set<string>();
   const cursor = new AgyTranscriptCursor();
   const decoder = new NodeStringDecoder.StringDecoder("utf8");
-  const transcriptOffset = { value: 0 };
+  const transcriptOffset = { value: baseline };
+  if (baseline > 0) {
+    // Reading starts past every earlier turn, so there is no prior-turn
+    // content left for the `USER_INPUT` heuristic to guess at.
+    state.transcriptPrimed = true;
+  }
   const assistantText = { emitted: false };
   activeChild = child;
   // A cancel during startup had no process to signal; deliver it now.

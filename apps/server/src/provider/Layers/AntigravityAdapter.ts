@@ -716,15 +716,17 @@ export function makeAntigravityAdapter(
         const steeringTurnId = ctx.promptsInFlight > 0 ? ctx.activeTurnId : undefined;
         const turnId = steeringTurnId ?? freshTurnId;
         const acceptedEpoch = ctx.cancelEpoch;
+        // Claimed together, without an intervening yield: assigning the active
+        // turn id later let a concurrent call see `promptsInFlight > 0` with no
+        // id yet and open a rival turn.
         ctx.promptsInFlight += 1;
+        ctx.activeTurnId = turnId;
         // Terminal-event bookkeeping. Publication happens in exactly one place
         // (the teardown below) so that the decision cannot race a steer.
-        let turnStarted = false;
         let stopReason: string | null = null;
         let promptSucceeded = false;
 
         return yield* Effect.gen(function* () {
-          ctx.activeTurnId = turnId;
           ctx.session = {
             ...ctx.session,
             activeTurnId: turnId,
@@ -757,7 +759,6 @@ export function makeAntigravityAdapter(
           // one folded into may have failed before it announced anything, and
           // emitting content for a turn that never started strands the UI.
           if (!ctx.startedTurnIds.has(turnId)) {
-            ctx.startedTurnIds.add(turnId);
             yield* offerRuntimeEvent({
               type: "turn.started",
               ...(yield* makeEventStamp()),
@@ -766,9 +767,11 @@ export function makeAntigravityAdapter(
               turnId,
               payload: { model: ctx.session.model },
             });
+            // Marked only after the event is actually out, so a failed publish
+            // cannot let another prompt emit a completion for a turn nobody
+            // saw start.
+            ctx.startedTurnIds.add(turnId);
           }
-          turnStarted = ctx.startedTurnIds.has(turnId);
-
           // Rechecked here rather than only at accept time: everything above
           // yields, and an interrupt during any of it means this prompt must
           // not reach the agent.
@@ -827,6 +830,10 @@ export function makeAntigravityAdapter(
               if (ctx.activeTurnId === turnId) {
                 ctx.activeTurnId = undefined;
               }
+              // Read from shared state rather than this call's local flag: the
+              // prompt that published `turn.started` may not be the one that
+              // settles the turn, and the settler still owes the completion.
+              const published = ctx.startedTurnIds.has(turnId);
               ctx.startedTurnIds.delete(turnId);
               // The public session field is what `listSessions` and the reaper
               // read, so leaving it set would advertise a turn that has ended.
@@ -838,7 +845,7 @@ export function makeAntigravityAdapter(
               // still owes consumers a terminal event; without one the turn
               // renders as running forever even though sendTurn already
               // returned an error.
-              if (!turnStarted) {
+              if (!published) {
                 return;
               }
               const state =
