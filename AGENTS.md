@@ -42,9 +42,9 @@ Known constraints, all inherent to print mode:
 
 - `agy` always runs with `--dangerously-skip-permissions` because print mode cannot prompt.
   Approvals instead come from the `PreToolUse` hook, which blocks the tool until T3 Code
-  answers — a `deny` decision genuinely stops it and is reported back to the model. Enable
-  with the `requireToolApproval` setting; it is off by default because each approval blocks
-  the turn on a human, and it fails closed on timeout or a lost bridge.
+  answers — a `deny` decision genuinely stops it and is reported back to the model. Controlled
+  by the `requireToolApproval` setting, on by default; it fails closed on timeout, a lost
+  bridge, or any hook failure. Turn it off to let tools run unattended.
 - Attachments are passed by path, not inline: the adapter sends `resource_link` blocks for
   files the attachment store already wrote to disk, and the bridge names those paths in the
   prompt and adds their directory to the workspace. `agy` has no attachment flag, so inline

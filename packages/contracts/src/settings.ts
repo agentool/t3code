@@ -376,9 +376,10 @@ export const AntigravitySettings = makeProviderSettingsSchema(
     // Print mode cannot prompt, so `agy` runs with permissions skipped and the
     // bridge's PreToolUse hook becomes the gate instead: it blocks the tool
     // until T3 Code answers, and a denial is reported back to the model.
-    // Off by default because every approval blocks the turn on a human.
+    // On by default: without it nothing stands between the model and an
+    // auto-approved tool, and a gate that has to be discovered protects no one.
     requireToolApproval: Schema.Boolean.pipe(
-      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.withDecodingDefault(Effect.succeed(true)),
       Schema.annotateKey({
         title: "Ask before running tools",
         description:
@@ -591,6 +592,7 @@ const AntigravitySettingsPatch = Schema.Struct({
   binaryPath: Schema.optionalKey(TrimmedString),
   printTimeout: Schema.optionalKey(TrimmedString),
   appDataDir: Schema.optionalKey(TrimmedString),
+  requireToolApproval: Schema.optionalKey(Schema.Boolean),
   customModels: Schema.optionalKey(Schema.Array(Schema.String)),
 });
 

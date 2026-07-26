@@ -43,9 +43,9 @@ const ANTIGRAVITY_PRESENTATION = {
   displayName: "Antigravity",
   badgeLabel: "Experimental",
   showInteractionModeToggle: false,
-  // The bridge passes `--model` when it spawns `agy`, so a model change only
-  // takes effect on a new session.
-  requiresNewThreadForModelChange: true,
+  // `--model` is a per-spawn flag that composes with `--conversation`, so the
+  // bridge applies a switch to the next turn without losing the trajectory.
+  requiresNewThreadForModelChange: false,
 } as const;
 
 const EMPTY_CAPABILITIES: ModelCapabilities = createModelCapabilities({ optionDescriptors: [] });

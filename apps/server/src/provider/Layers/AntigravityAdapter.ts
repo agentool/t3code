@@ -9,8 +9,8 @@
  *     `--dangerously-skip-permissions` because print mode cannot prompt. When
  *     `requireToolApproval` is set, the bridge's `PreToolUse` hook becomes the
  *     gate instead: it blocks the tool until this adapter answers, and a
- *     denial is reported back to the model. Off by default, since every
- *     approval stops the turn until a human replies.
+ *     denial is reported back to the model. On by default: without it nothing
+ *     stands between the model and an auto-approved tool.
  *   - **No session modes.** Print mode has no plan/ask distinction to switch.
  *   - **Attachments travel by reference.** `agy --print` has no attachment
  *     flag, so files are sent as `resource_link` blocks and the bridge stages
@@ -293,7 +293,9 @@ export function makeAntigravityAdapter(
         const pending = approvalsByThread.get(ctx.threadId);
         if (pending) {
           for (const [, approval] of pending) {
-            yield* Deferred.succeed(approval.decision, "cancel");
+            // Ignored: an answer racing session stop may have settled this
+            // already, and that must not abort the rest of teardown.
+            yield* Effect.ignore(Deferred.succeed(approval.decision, "cancel"));
           }
           approvalsByThread.delete(ctx.threadId);
         }
@@ -668,8 +670,15 @@ export function makeAntigravityAdapter(
 
         // A sendTurn while a prompt is in flight is a steer: the new prompt
         // folds into the ongoing work, so the active turn id is reused.
+        //
+        // The id is minted first, before anything is read, so that reading
+        // `promptsInFlight` and claiming it are one synchronous step. Yielding
+        // between the two — which generating the id here used to do — let two
+        // concurrent calls both observe zero and open rival turns over the
+        // same thread.
+        const freshTurnId = TurnId.make(yield* randomUUIDv4);
         const steeringTurnId = ctx.promptsInFlight > 0 ? ctx.activeTurnId : undefined;
-        const turnId = steeringTurnId ?? TurnId.make(yield* randomUUIDv4);
+        const turnId = steeringTurnId ?? freshTurnId;
         ctx.promptsInFlight += 1;
         // Terminal-event bookkeeping. Publication happens in exactly one place
         // (the teardown below) so that the decision cannot race a steer.
@@ -791,7 +800,10 @@ export function makeAntigravityAdapter(
                 turnId,
                 payload: { state, stopReason },
               });
-            }).pipe(Effect.catch(() => Effect.void)),
+              // `catchCause` rather than `catch`: a defect while stamping or
+              // publishing would otherwise escape after `promptsInFlight` was
+              // already decremented, stranding the turn as running.
+            }).pipe(Effect.catchCause(() => Effect.void)),
           ),
         );
       });
@@ -806,7 +818,7 @@ export function makeAntigravityAdapter(
         const pending = approvalsByThread.get(threadId);
         if (pending) {
           for (const [, approval] of pending) {
-            yield* Deferred.succeed(approval.decision, "cancel");
+            yield* Effect.ignore(Deferred.succeed(approval.decision, "cancel"));
           }
           pending.clear();
         }

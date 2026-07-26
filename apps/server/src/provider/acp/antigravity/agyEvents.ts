@@ -213,6 +213,11 @@ export interface AgyTurnState {
    * byte 0, which on a resumed conversation is the start of the whole history.
    */
   transcriptPrimed: boolean;
+  /**
+   * Whether this turn resumed an existing conversation. Only then can the
+   * transcript already hold other turns' records at byte 0.
+   */
+  readonly resumedConversation: boolean;
   modelName: string | undefined;
 }
 
@@ -225,6 +230,7 @@ export function makeAgyTurnState(conversationId?: string): AgyTurnState {
     transcriptPath: undefined,
     resolvedTranscriptPath: undefined,
     transcriptPrimed: false,
+    resumedConversation: conversationId !== undefined,
     modelName: undefined,
   };
 }
@@ -394,7 +400,7 @@ export interface AgyHookDecision {
  */
 export function approvalOutcomeToDecision(
   result: unknown,
-  approveOptionId: string,
+  approveOptionIds: ReadonlyArray<string>,
 ): AgyHookDecision {
   const outcome =
     typeof result === "object" && result !== null
@@ -404,7 +410,11 @@ export function approvalOutcomeToDecision(
     typeof outcome === "object" && outcome !== null
       ? (outcome as { outcome?: unknown; optionId?: unknown })
       : undefined;
-  if (selected?.outcome === "selected" && selected.optionId === approveOptionId) {
+  if (
+    selected?.outcome === "selected" &&
+    typeof selected.optionId === "string" &&
+    approveOptionIds.includes(selected.optionId)
+  ) {
     return { decision: "allow" };
   }
   return { decision: "deny", reason: "Rejected in T3 Code" };

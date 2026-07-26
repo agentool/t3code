@@ -19,6 +19,7 @@ import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeStringDecoder from "node:string_decoder";
 import * as NodeURL from "node:url";
 
 import packageJson from "../../../../package.json" with { type: "json" };
@@ -324,7 +325,16 @@ function readHookEvents(hookDir: string, seen: Set<string>): ReadonlyArray<Obser
 // ── Tool approval ─────────────────────────────────────────────────────
 
 const APPROVE_OPTION = "allow";
+const APPROVE_SESSION_OPTION = "allow-session";
 const REJECT_OPTION = "reject";
+/**
+ * Sessions the user has approved wholesale via "always allow".
+ *
+ * Without an `allow_always` option the client maps that choice to no option id
+ * at all and the reply reads as cancelled — which this gate denies. Offering
+ * it and honouring it here is what makes the button mean what it says.
+ */
+const sessionWideApprovals = new Set<string>();
 
 function approvalRequired(): boolean {
   return process.env[REQUIRE_APPROVAL_ENV]?.trim() === "1";
@@ -353,12 +363,23 @@ function writeDecision(hookDir: string, hookName: string, decision: AgyHookDecis
  * Fire-and-forget by design: `drain` runs on a timer and must not block the
  * transcript reader while a human decides.
  */
+function selectedOptionId(result: unknown): string | undefined {
+  const outcome = isRecord(result) ? result["outcome"] : undefined;
+  const optionId = isRecord(outcome) ? outcome["optionId"] : undefined;
+  return typeof optionId === "string" ? optionId : undefined;
+}
+
 function requestToolApproval(input: {
   readonly sessionId: string;
   readonly hookDir: string;
   readonly hookName: string;
   readonly payload: AgyHookPayload;
 }): void {
+  // Already approved for the whole session: answer without troubling the user.
+  if (sessionWideApprovals.has(input.sessionId)) {
+    writeDecision(input.hookDir, input.hookName, { decision: "allow" });
+    return;
+  }
   const toolCall = input.payload.toolCall;
   const stepIdx = typeof input.payload.stepIdx === "number" ? input.payload.stepIdx : 0;
   void sendRequest(
@@ -375,17 +396,22 @@ function requestToolApproval(input: {
       },
       options: [
         { optionId: APPROVE_OPTION, name: "Allow", kind: "allow_once" },
+        {
+          optionId: APPROVE_SESSION_OPTION,
+          name: "Allow for this session",
+          kind: "allow_always",
+        },
         { optionId: REJECT_OPTION, name: "Reject", kind: "reject_once" },
       ],
     },
     APPROVAL_WAIT_MS,
   )
     .then((result) => {
-      writeDecision(
-        input.hookDir,
-        input.hookName,
-        approvalOutcomeToDecision(result, APPROVE_OPTION),
-      );
+      const decision = approvalOutcomeToDecision(result, [APPROVE_OPTION, APPROVE_SESSION_OPTION]);
+      if (decision.decision === "allow" && selectedOptionId(result) === APPROVE_SESSION_OPTION) {
+        sessionWideApprovals.add(input.sessionId);
+      }
+      writeDecision(input.hookDir, input.hookName, decision);
     })
     .catch(() => {
       writeDecision(input.hookDir, input.hookName, {
@@ -726,6 +752,7 @@ function drain(input: {
   readonly seenHooks: Set<string>;
   readonly state: AgyTurnState;
   readonly cursor: AgyTranscriptCursor;
+  readonly decoder: NodeStringDecoder.StringDecoder;
   readonly transcriptOffset: { value: number };
   readonly assistantText: { emitted: boolean };
   readonly final: boolean;
@@ -784,7 +811,11 @@ function drain(input: {
           const length = stats.size - input.transcriptOffset.value;
           const buffer = Buffer.alloc(length);
           NodeFS.readSync(fd, buffer, 0, length, input.transcriptOffset.value);
-          chunk = buffer.toString("utf8");
+          // Decoded through the turn's streaming decoder, not `toString`: a
+          // write can land mid-multibyte-character, and decoding each slice
+          // independently would replace the partial sequence with U+FFFD and
+          // advance past it, silently corrupting non-ASCII output.
+          chunk = input.decoder.write(buffer);
           input.transcriptOffset.value = stats.size;
         } finally {
           NodeFS.closeSync(fd);
@@ -799,8 +830,18 @@ function drain(input: {
     // Reading always starts at byte 0, so the first batch of a resumed
     // conversation carries every prior turn. Trim once, then stream.
     if (!input.state.transcriptPrimed && allLines.length > 0) {
-      allLines = [...dropPriorTurnRecords(allLines)];
-      input.state.transcriptPrimed = true;
+      const trimmed = dropPriorTurnRecords(allLines);
+      if (trimmed.length === allLines.length && input.state.resumedConversation && !input.final) {
+        // Resuming, and this batch holds no `USER_INPUT` — so the current
+        // turn's opening record has not been written yet and everything here
+        // belongs to a previous turn. Emitting it would replay old output;
+        // hold off and re-examine once more has been appended.
+        input.cursor.retain(allLines);
+        allLines = [];
+      } else {
+        allLines = [...trimmed];
+        input.state.transcriptPrimed = true;
+      }
     }
     for (const line of allLines) {
       const record = parseTranscriptLine(line);
@@ -915,6 +956,7 @@ async function runTurn(
   const state = makeAgyTurnState(session.conversationId);
   const seenHooks = new Set<string>();
   const cursor = new AgyTranscriptCursor();
+  const decoder = new NodeStringDecoder.StringDecoder("utf8");
   const transcriptOffset = { value: 0 };
   const assistantText = { emitted: false };
   activeChild = child;
@@ -941,6 +983,7 @@ async function runTurn(
       seenHooks,
       state,
       cursor,
+      decoder,
       transcriptOffset,
       assistantText,
       final: false,
@@ -961,6 +1004,7 @@ async function runTurn(
     seenHooks,
     state,
     cursor,
+    decoder,
     transcriptOffset,
     assistantText,
     final: true,

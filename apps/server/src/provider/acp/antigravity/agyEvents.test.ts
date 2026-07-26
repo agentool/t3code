@@ -220,9 +220,20 @@ describe("hookSessionUpdate", () => {
 });
 
 describe("approvalOutcomeToDecision", () => {
+  it("accepts any of the configured approve options", () => {
+    // The client renders an "always allow" choice; without it in this list a
+    // user pressing it would have their tool denied.
+    expect(
+      approvalOutcomeToDecision({ outcome: { outcome: "selected", optionId: "allow-session" } }, [
+        "allow",
+        "allow-session",
+      ]).decision,
+    ).toBe("allow");
+  });
+
   it("allows only an explicit selection of the approve option", () => {
     expect(
-      approvalOutcomeToDecision({ outcome: { outcome: "selected", optionId: "allow" } }, "allow"),
+      approvalOutcomeToDecision({ outcome: { outcome: "selected", optionId: "allow" } }, ["allow"]),
     ).toEqual({ decision: "allow" });
   });
 
@@ -239,7 +250,7 @@ describe("approvalOutcomeToDecision", () => {
       undefined,
       "allow",
     ]) {
-      expect(approvalOutcomeToDecision(reply, "allow").decision).toBe("deny");
+      expect(approvalOutcomeToDecision(reply, ["allow"]).decision).toBe("deny");
     }
   });
 });

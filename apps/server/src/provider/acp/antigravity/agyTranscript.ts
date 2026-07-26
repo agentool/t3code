@@ -208,6 +208,17 @@ export class AgyTranscriptCursor {
     return lines;
   }
 
+  /**
+   * Push whole lines back to the front of the stream.
+   *
+   * Used when a batch cannot be interpreted yet — on a resumed conversation the
+   * current turn's opening record may not have been written — so the same lines
+   * are re-examined against the next read rather than emitted or discarded.
+   */
+  retain(lines: ReadonlyArray<string>): void {
+    this.carry = lines.length > 0 ? `${lines.join("\n")}\n${this.carry}` : this.carry;
+  }
+
   /** Flush the trailing line once the writer is known to be finished. */
   flush(): ReadonlyArray<string> {
     const remaining = this.carry;
