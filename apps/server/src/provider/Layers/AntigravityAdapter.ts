@@ -176,14 +176,9 @@ interface AntigravitySessionContext {
   readonly approvals: Map<ApprovalRequestId, PendingApproval>;
   /** Bridge-side session id, needed to address provider-specific notifications. */
   readonly acpSessionId: string;
-  /**
-   * Ids of prompts accepted but not yet answered by the bridge. An interrupt
-   * fences exactly these, so a cancel can never stop a prompt submitted after
-   * it — which every session-scoped variant of this did.
-   */
-  readonly outstandingPromptIds: Set<string>;
-  /** Counter behind `outstandingPromptIds`; unique within this session. */
-  nextPromptSeq: number;
+
+  /** Cancel epoch the active turn belongs to; steering is scoped to it. */
+  activeTurnEpoch: number;
   /**
    * Number of prompts in flight. >0 means a turn is running, so a new
    * sendTurn steers the existing turn rather than opening a new one.
@@ -700,8 +695,7 @@ export function makeAntigravityAdapter(
             teardownSignal: yield* Deferred.make<void>(),
             approvals: pendingApprovals,
             acpSessionId: started.sessionId,
-            outstandingPromptIds: new Set(),
-            nextPromptSeq: 0,
+            activeTurnEpoch: -1,
             promptsInFlight: 0,
             stopped: false,
           };
@@ -847,21 +841,14 @@ export function makeAntigravityAdapter(
         }).pipe(Effect.scoped),
       );
 
-    const sendTurn: AntigravityAdapterShape["sendTurn"] = (input) => {
-      // Captured outside the workflow so the finalizer can retire the id no
-      // matter where inside it things stopped.
-      let registered: { ctx: AntigravitySessionContext; promptId: string } | undefined;
-      return Effect.gen(function* () {
+    const sendTurn: AntigravityAdapterShape["sendTurn"] = (input) =>
+      Effect.gen(function* () {
         const ctx = yield* requireSession(input.threadId);
-        // Claimed before any yielding preparation. Attachment resolution and id
-        // generation both yield, and a Stop landing in that window would
-        // otherwise find nothing outstanding to fence — the prompt would then
-        // reach `agy` carrying the post-cancel state and pass every check.
-        ctx.nextPromptSeq += 1;
-        const promptId = `${ctx.acpSessionId}-${ctx.nextPromptSeq}`;
+        // Read before any yielding preparation. Attachment resolution and id
+        // generation both yield, and a Stop landing in that window raises the
+        // cancelled mark past this value — so the prompt is still covered by
+        // the fence even though it had not been submitted yet.
         const acceptedEpoch = ctx.cancelEpoch;
-        ctx.outstandingPromptIds.add(promptId);
-        registered = { ctx, promptId };
 
         // `agy --print` takes a single text prompt, so attachments travel as
         // `resource_link` blocks (ACP baseline, no capability needed) pointing
@@ -919,13 +906,20 @@ export function makeAntigravityAdapter(
         // concurrent calls both observe zero and open rival turns over the
         // same thread.
         const freshTurnId = TurnId.make(yield* randomUUIDv4);
-        const steeringTurnId = ctx.promptsInFlight > 0 ? ctx.activeTurnId : undefined;
+        // Same epoch only: a prompt accepted after a Stop must not fold into the
+        // turn that Stop cancelled, or it would inherit its id and publish a
+        // completion for it while the cancelled one is still settling.
+        const steeringTurnId =
+          ctx.promptsInFlight > 0 && ctx.activeTurnEpoch === acceptedEpoch
+            ? ctx.activeTurnId
+            : undefined;
         const turnId = steeringTurnId ?? freshTurnId;
         // Claimed together, without an intervening yield: assigning the active
         // turn id later let a concurrent call see `promptsInFlight > 0` with no
         // id yet and open a rival turn.
         ctx.promptsInFlight += 1;
         ctx.activeTurnId = turnId;
+        ctx.activeTurnEpoch = acceptedEpoch;
         // Terminal-event bookkeeping. Publication happens in exactly one place
         // (the teardown below) so that the decision cannot race a steer.
         let stopReason: string | null = null;
@@ -1059,7 +1053,7 @@ export function makeAntigravityAdapter(
                   Effect.raceFirst(ctx.acp.drainEvents, Deferred.await(ctx.teardownSignal)),
                 );
                 return yield* ctx.acp
-                  .prompt({ prompt: promptParts, _meta: { t3: { promptId } } })
+                  .prompt({ prompt: promptParts, _meta: { t3: { epoch: acceptedEpoch } } })
                   .pipe(
                     Effect.tapCause(() => drain),
                     Effect.tap(() => drain),
@@ -1153,30 +1147,17 @@ export function makeAntigravityAdapter(
             }).pipe(Effect.catchCause(() => Effect.void)),
           ),
         );
-      }).pipe(
-        // Registered before validation and attachment work so a Stop landing
-        // during those can still fence this prompt — which means its removal
-        // has to cover them failing too. An id left behind would be re-fenced
-        // by every later Stop.
-        Effect.ensuring(
-          Effect.sync(() => {
-            registered?.ctx.outstandingPromptIds.delete(registered.promptId);
-          }),
-        ),
-      );
-    };
+      });
 
     const interruptTurn: AntigravityAdapterShape["interruptTurn"] = (threadId) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(threadId);
         // Recorded before anything else: prompts already accepted but still
         // queued upstream compare against this and refuse to submit.
+        // Read and bumped in one synchronous step: everything accepted up to
+        // and including this value is what the fence below covers.
+        const cancelledThrough = ctx.cancelEpoch;
         ctx.cancelEpoch += 1;
-        // Snapshotted in the same synchronous step as the bump. A live Set
-        // iterator yields entries added during iteration, so a prompt accepted
-        // after this cancel would be fenced by it and wrongly reported
-        // cancelled.
-        const fencedPromptIds = [...ctx.outstandingPromptIds];
         // Settled before the cancel goes out, as ACP requires: an outstanding
         // permission request has a hook process blocked behind it, and the
         // bridge turns "cancel" into a denial. Leaving it pending would hold
@@ -1194,9 +1175,13 @@ export function makeAntigravityAdapter(
         // lets the bridge recognise and stop that one. Sending it
         // unconditionally would instead fence a cancel that arrived after its
         // own turn ended, killing the next unrelated prompt.
-        for (const outstanding of fencedPromptIds) {
-          yield* Effect.ignore(ctx.acp.notify("t3/fence", { promptId: outstanding }));
-        }
+        // One notification names the epoch being cancelled through, rather than
+        // one per outstanding prompt. Everything accepted at or below it is
+        // cancelled; anything accepted afterwards carries a higher epoch and is
+        // untouched, so nothing has to be tracked per prompt or evicted.
+        yield* Effect.ignore(
+          ctx.acp.notify("t3/fence", { sessionId: ctx.acpSessionId, epoch: cancelledThrough }),
+        );
         yield* Effect.ignore(
           ctx.acp.cancel.pipe(
             Effect.mapError((error) =>

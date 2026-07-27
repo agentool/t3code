@@ -830,57 +830,34 @@ let activeChild: NodeChildProcess.ChildProcess | null = null;
 let activeTurnSessionId: string | null = null;
 const cancelledSessions = new Set<string>();
 /**
- * Cancels seen per session, counted rather than flagged.
+ * Highest cancelled epoch per session.
  *
- * A prompt records this value when it is queued. If the count has moved by the
- * time the prompt reaches the front, a cancel arrived while it waited and the
- * prompt must not run — turns are serialized, so a steer queued behind a long
- * turn would otherwise start executing tools after the user pressed Stop. A
- * counter rather than a flag is what keeps this from also swallowing a cancel
- * that lands harmlessly between two turns.
- */
-const cancelGenerations = new Map<string, number>();
-/**
- * Ids of individual prompts the client cancelled before they arrived.
+ * Each submission carries the adapter's cancel epoch, and an interrupt names
+ * the epoch it is cancelling *through*. Everything at or below that is
+ * cancelled; anything accepted afterwards has a higher epoch and is untouched.
  *
- * The generation check compares a prompt's enqueue-time value against its
- * run-time value, which cannot see a cancel that landed *before* the prompt
- * arrived — the prompt simply reads the post-cancel value and matches, and the
- * runtime forks its cancel notification, so that ordering is real.
- *
- * Keyed by prompt, not by session: every session-scoped variant of this ends
- * up cancelling some later, unrelated prompt, because "a cancel happened and
- * no turn is running" also describes a cancel that merely arrived after its
- * own turn finished. The adapter stamps each submission with an id and names
- * that exact id when it fences, so a fence can only ever stop the prompt it
- * was meant for.
+ * This replaces a set of individual prompt ids. Keying by id needed the set to
+ * be bounded, and any eviction policy can drop a fence whose prompt has not
+ * arrived yet — which would let exactly the prompt being cancelled run. A
+ * single high-water mark per session cannot lose one and cannot grow.
  */
-const fencedPromptIds = new Set<string>();
-/**
- * Upper bound on remembered fences. A fence whose prompt already arrived is
- * applied immediately instead of stored, so this only holds ids still in
- * transit; the cap exists so a client that fences prompts it never sends
- * cannot grow the set without limit.
- */
-const MAX_FENCED_PROMPT_IDS = 256;
-/** Prompt id of the turn currently running, so a fence can reach it. */
-let activeTurnPromptId: string | undefined;
-/** Token of the turn currently running, retired when its prompt is fenced. */
-let activeTurnToken: TurnToken | undefined;
+const cancelledThroughEpoch = new Map<string, number>();
 
-/** The adapter's per-submission id, carried in `_meta.t3.promptId`. */
-function promptIdOf(params: Record<string, unknown>): string | undefined {
+function cancelledThrough(sessionId: string): number {
+  return cancelledThroughEpoch.get(sessionId) ?? -1;
+}
+
+/** The adapter's cancel epoch for a submission, carried in `_meta.t3.epoch`. */
+function promptEpochOf(params: Record<string, unknown>): number | undefined {
   const meta = params["_meta"];
   const t3 = isRecord(meta) ? meta["t3"] : undefined;
-  const promptId = isRecord(t3) ? t3["promptId"] : undefined;
-  return typeof promptId === "string" && promptId.length > 0 ? promptId : undefined;
+  const epoch = isRecord(t3) ? t3["epoch"] : undefined;
+  return typeof epoch === "number" ? epoch : undefined;
 }
-/** Cancel generation captured when each queued prompt was accepted, by JSON-RPC id. */
-const queuedPromptGenerations = new Map<unknown, number>();
-
-function cancelGeneration(sessionId: string): number {
-  return cancelGenerations.get(sessionId) ?? 0;
-}
+/** Cancel epoch of the turn currently running, so a fence can reach it. */
+let activeTurnEpoch = -1;
+/** Token of that turn, retired when its epoch is cancelled. */
+let activeTurnToken: TurnToken | undefined;
 
 /**
  * Drain everything Antigravity has produced so far and emit it as ACP updates.
@@ -1078,7 +1055,7 @@ async function runTurn(
   sessionId: string,
   session: BridgeSession,
   prompt: RenderedPrompt,
-  promptId: string | undefined,
+  promptEpoch: number,
 ): Promise<TurnOutcome> {
   // A cancel that raced the end of an earlier turn must not decide this one.
   cancelledSessions.delete(sessionId);
@@ -1139,9 +1116,9 @@ async function runTurn(
   }
   const assistantText = { emitted: false };
   const turnToken: TurnToken = { sessionId, live: true };
-  // Published so an out-of-band fence naming this prompt can retire the turn
-  // rather than being stored for an arrival that already happened.
-  activeTurnPromptId = promptId;
+  // Published so an out-of-band fence covering this epoch can retire the turn
+  // rather than being recorded for an arrival that already happened.
+  activeTurnEpoch = promptEpoch;
   activeTurnToken = turnToken;
   activeChild = child;
   // A cancel during startup had no process to signal; deliver it now.
@@ -1219,12 +1196,8 @@ async function runTurn(
   // now resolves to a denial rather than writing into a vanishing directory or
   // banking a blanket approval for the next turn.
   turnToken.live = false;
-  activeTurnPromptId = undefined;
+  activeTurnEpoch = -1;
   activeTurnToken = undefined;
-  if (promptId !== undefined) {
-    // Its fence, if any, has been dealt with; nothing may consume it later.
-    fencedPromptIds.delete(promptId);
-  }
   cleanupDir(hookDir);
   cleanupDir(hookWorkspace);
   cleanupDir(attachmentDir);
@@ -1342,26 +1315,18 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
       return;
     }
     case "session/prompt": {
-      // Read and cleared before the session is validated: an unknown session
-      // returns early below, and leaving the entry behind would grow this map
-      // for every bad id a client sends.
-      const queuedAt = queuedPromptGenerations.get(id);
-      queuedPromptGenerations.delete(id);
       const sessionId = typeof params["sessionId"] === "string" ? params["sessionId"] : undefined;
       const session = sessionId ? sessions.get(sessionId) : undefined;
       if (!sessionId || !session) {
         sendError(id, -32602, "unknown sessionId");
         return;
       }
-      // Consumed by id, so a fence can only stop the prompt it named; anything
-      // the user sends afterwards runs normally.
-      const promptId = promptIdOf(params);
-      const cancelledInTransit = promptId !== undefined && fencedPromptIds.delete(promptId);
-      if (
-        cancelledInTransit ||
-        (queuedAt !== undefined && queuedAt !== cancelGeneration(sessionId))
-      ) {
-        // Cancelled while it sat in the queue; never spawn `agy` for it.
+      // Compared against the session's cancelled high-water mark. A cancel
+      // that outran this prompt raised that mark, and anything the user sends
+      // afterwards carries a higher epoch and is unaffected.
+      const promptEpoch = promptEpochOf(params) ?? 0;
+      if (promptEpoch <= cancelledThrough(sessionId)) {
+        // Cancelled before it could start; never spawn `agy` for it.
         sendResult(id, { stopReason: "cancelled" });
         return;
       }
@@ -1370,7 +1335,7 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
         sendError(id, -32602, "session/prompt requires at least one text block");
         return;
       }
-      const outcome = await runTurn(sessionId, session, prompt, promptId);
+      const outcome = await runTurn(sessionId, session, prompt, promptEpoch);
       if (outcome.failure) {
         sendError(id, -32000, `Antigravity turn failed: ${outcome.failure}`);
         return;
@@ -1378,45 +1343,36 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
       sendResult(id, { stopReason: outcome.stopReason });
       return;
     }
-    // Sent by the adapter immediately before it cancels, and only while it has
-    // a prompt outstanding. Notifications carry no id, so nothing is replied.
+    // Sent by the adapter immediately before it cancels, naming the epoch it
+    // is cancelling through. Handled out of band: queued, it would sit behind
+    // the very prompt it is meant to stop. Notifications carry no id, so
+    // nothing is replied.
     case "t3/fence": {
-      const promptId = typeof params["promptId"] === "string" ? params["promptId"] : undefined;
-      if (!promptId) {
+      const sessionId = typeof params["sessionId"] === "string" ? params["sessionId"] : undefined;
+      const epoch = typeof params["epoch"] === "number" ? params["epoch"] : undefined;
+      if (!sessionId || epoch === undefined) {
         return;
       }
-      if (activeTurnToken && promptId === activeTurnPromptId) {
-        // Already running: there is nothing to stop on arrival, so the fence is
-        // applied to the turn itself. Retiring the token denies any approval
-        // still in flight, including ones the adapter would auto-approve.
+      cancelledThroughEpoch.set(sessionId, Math.max(cancelledThrough(sessionId), epoch));
+      // A turn already running under a cancelled epoch has nothing left to
+      // stop on arrival, so it is stopped here. Retiring the token is what
+      // makes an approval still in flight deny, including one the client
+      // would auto-approve.
+      if (activeTurnToken?.sessionId === sessionId && activeTurnEpoch <= epoch) {
         activeTurnToken.live = false;
-        cancelledSessions.add(activeTurnToken.sessionId);
+        cancelledSessions.add(sessionId);
         activeChild?.kill("SIGTERM");
-        return;
       }
-      if (fencedPromptIds.size >= MAX_FENCED_PROMPT_IDS) {
-        // Oldest first: a fence this stale describes a prompt that is never
-        // going to arrive.
-        const oldest = fencedPromptIds.values().next();
-        if (!oldest.done) {
-          fencedPromptIds.delete(oldest.value);
-        }
-      }
-      fencedPromptIds.add(promptId);
       return;
     }
     case "session/cancel": {
       const sessionId = typeof params["sessionId"] === "string" ? params["sessionId"] : undefined;
-      if (sessionId && sessions.has(sessionId)) {
-        // Always recorded, so prompts already queued for this session can see
-        // that a cancel happened and refuse to start.
-        cancelGenerations.set(sessionId, cancelGeneration(sessionId) + 1);
-
-        // Only a cancel aimed at the turn actually running decides its stop
-        // reason. Cancels bypass the request queue, so one arriving after a
-        // turn finished — or targeting an idle session — must not sit in the
-        // set and mark the next successful turn cancelled.
-        if (sessionId === activeTurnSessionId) {
+      if (sessionId && sessions.has(sessionId) && sessionId === activeTurnSessionId) {
+        // Only the turn actually running is stopped, and only when its epoch
+        // has been cancelled. A prompt accepted after the fence carries a
+        // higher epoch and must survive this notification, which the runtime
+        // forks and can therefore deliver late.
+        if (activeTurnEpoch <= cancelledThrough(sessionId)) {
           cancelledSessions.add(sessionId);
           activeChild?.kill("SIGTERM");
         }
@@ -1484,14 +1440,6 @@ export async function runAgyBridge(): Promise<void> {
         continue;
       }
       const pending = message;
-      // Captured now, not when the turn starts: the gap between the two is
-      // exactly the window a cancel has to arrive in while this prompt waits.
-      if (pending["method"] === "session/prompt") {
-        const target = (pending["params"] as Record<string, unknown> | undefined)?.["sessionId"];
-        if (typeof target === "string" && pending["id"] !== undefined && sessions.has(target)) {
-          queuedPromptGenerations.set(pending["id"], cancelGeneration(target));
-        }
-      }
       queue = queue
         .then(() => handleRequest(pending))
         .catch((error: unknown) => {
