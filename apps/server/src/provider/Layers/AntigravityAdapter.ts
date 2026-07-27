@@ -89,6 +89,12 @@ const PROVIDER = ProviderDriverKind.make("antigravity");
  * unanswered request pinning its entry and its UI prompt forever.
  */
 const APPROVAL_WAIT_MS = 11 * 60 * 1000;
+/**
+ * How long to let the bridge answer a cancelled prompt on its own before
+ * interrupting the RPC. Only a backstop against a wedged bridge; the normal
+ * path settles well inside it.
+ */
+const CANCEL_ACK_TIMEOUT_MS = 10_000;
 const ANTIGRAVITY_RESUME_VERSION = 1 as const;
 
 export interface AntigravityAdapterLiveOptions {
@@ -1185,25 +1191,31 @@ export function makeAntigravityAdapter(
           }
           pending.clear();
         }
-        // Fenced before cancelling, and only with a prompt outstanding. The
-        // runtime forks its cancel notification, so a prompt written just
-        // before this can still reach the bridge afterwards; the fence is what
-        // lets the bridge recognise and stop that one. Sending it
-        // unconditionally would instead fence a cancel that arrived after its
-        // own turn ended, killing the next unrelated prompt.
-        // One notification names the epoch being cancelled through, rather than
-        // one per outstanding prompt. Everything accepted at or below it is
-        // cancelled; anything accepted afterwards carries a higher epoch and is
-        // untouched, so nothing has to be tracked per prompt or evicted.
+        // The fence names the epoch being cancelled through, rather than one
+        // notification per outstanding prompt. Everything accepted at or below
+        // it is cancelled; anything accepted afterwards carries a higher epoch
+        // and is untouched, so nothing has to be tracked per prompt.
         yield* Effect.ignore(
           ctx.acp.notify("t3/fence", { sessionId: ctx.acpSessionId, epoch: cancelledThrough }),
         );
-        yield* Effect.ignore(
-          ctx.acp.cancel.pipe(
-            Effect.mapError((error) =>
-              mapAcpToAdapterError(PROVIDER, threadId, "session/cancel", error),
+        // Sent as a plain notification rather than through `acp.cancel`, which
+        // interrupts the local prompt RPC. That interrupt settles the turn and
+        // releases the gate before the bridge has killed `agy` and run its
+        // final drain, so the transcript and failed-tool updates that drain
+        // produces arrive with no turn to belong to. Delivered this way the
+        // bridge answers the original prompt itself, after its updates are on
+        // the wire, and the turn settles on that response.
+        yield* Effect.ignore(ctx.acp.notify("session/cancel", { sessionId: ctx.acpSessionId }));
+        // Fallback: if the bridge never answers — wedged, or already gone — the
+        // interrupt still happens, just late enough not to truncate a healthy
+        // drain. Forked into the session scope so it dies with the session.
+        yield* Effect.forkIn(
+          Effect.sleep(CANCEL_ACK_TIMEOUT_MS).pipe(
+            Effect.flatMap(() =>
+              ctx.activeTurnId === undefined ? Effect.void : Effect.ignore(ctx.acp.cancel),
             ),
           ),
+          ctx.scope,
         );
       });
 
