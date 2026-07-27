@@ -35,6 +35,7 @@ import {
   type ThreadId,
   TurnId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -943,11 +944,23 @@ export function makeAntigravityAdapter(
                 // that depend on it stopped being attributed even though
                 // prompts kept completing.
                 Effect.catchCause((cause) =>
-                  Effect.logError("Failed to process Antigravity runtime notification.", { cause }),
+                  // Interrupts pass through. Swallowing them kept this fiber
+                  // alive through teardown, so `Fiber.interrupt` waited on a
+                  // consumer that had been told to stop and would not —
+                  // stranding the session and its bridge.
+                  Cause.hasInterruptsOnly(cause)
+                    ? Effect.failCause(cause)
+                    : Effect.logError("Failed to process Antigravity runtime notification.", {
+                        cause,
+                      }),
                 ),
               ),
             ),
           ).pipe(
+            // Absorbs a typed failure that escapes the per-event handler while
+            // leaving interruption alone — `Effect.catch` does not catch it —
+            // so teardown can still stop this fiber.
+            Effect.catch(() => Effect.void),
             // However this consumer ends — teardown, a defect while stamping,
             // an interrupt — it fires the same signal drains wait on. Without
             // it a consumer that died on its own would leave every later drain

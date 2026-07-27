@@ -1418,6 +1418,10 @@ async function runTurn(
   // holding this claim. Leaving it unset until after the spawn would silently
   // drop those, letting an auto-approving child run on past a cancelled turn.
   activeTurnSessionId = sessionId;
+  // Claimed together. Setting the epoch later left a window where this turn
+  // looked untagged, and an untagged turn is cancelled unconditionally — so a
+  // late cancel carrying an older epoch would kill a turn it does not cover.
+  activeTurnEpoch = promptEpoch;
   // Rotated before the spawn, so the child is handed this turn's secret: a tool
   // approved in an earlier turn holds that turn's, and cannot sign anything
   // this one will accept.
@@ -1487,7 +1491,6 @@ async function runTurn(
   const turnToken: TurnToken = { sessionId, live: true };
   // Published so an out-of-band fence covering this epoch can retire the turn
   // rather than being recorded for an arrival that already happened.
-  activeTurnEpoch = promptEpoch;
   activeTurnToken = turnToken;
   activeChild = child;
   if (child.pid !== undefined) {
