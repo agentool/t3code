@@ -89,6 +89,11 @@ const PROVIDER = ProviderDriverKind.make("antigravity");
  * unanswered request pinning its entry and its UI prompt forever.
  */
 const APPROVAL_WAIT_MS = 11 * 60 * 1000;
+/**
+ * Cap on waiting for queued ACP events to be consumed before a turn settles.
+ * Only an ordering nicety, so it must never outlive a torn-down consumer.
+ */
+const EVENT_DRAIN_TIMEOUT_MS = 5_000;
 const ANTIGRAVITY_RESUME_VERSION = 1 as const;
 
 export interface AntigravityAdapterLiveOptions {
@@ -127,11 +132,19 @@ interface AntigravitySessionContext {
    */
   cancelEpoch: number;
   /**
-   * Turns for which `turn.started` has actually been published. Shared rather
-   * than per-call, so a steer cannot assume the prompt it folded into already
-   * announced the turn — that prompt may have failed during preflight.
+   * Turns whose `turn.started` a prompt has reserved the right to publish.
+   * Shared rather than per-call, so a steer cannot assume the prompt it folded
+   * into already announced the turn — that prompt may have failed in preflight.
    */
-  readonly startedTurnIds: Set<TurnId>;
+  readonly reservedTurnIds: Set<TurnId>;
+  /**
+   * Turns whose `turn.started` is actually on the wire.
+   *
+   * Kept apart from the reservation: teardown may run while a start is still
+   * being stamped, and completing a turn nobody has seen start is as wrong as
+   * dropping the completion of one they have.
+   */
+  readonly publishedTurnIds: Set<TurnId>;
   /**
    * Serializes prompt submission for this thread.
    *
@@ -336,8 +349,9 @@ export function makeAntigravityAdapter(
         // left to settle and stays silent. Otherwise closing the scope wakes
         // `acp.prompt` on another fiber and its completion lands after
         // `session.exited` — or on whatever session replaced this one.
-        const orphanedTurnIds = [...ctx.startedTurnIds];
-        ctx.startedTurnIds.clear();
+        const orphanedTurnIds = [...ctx.publishedTurnIds];
+        ctx.publishedTurnIds.clear();
+        ctx.reservedTurnIds.clear();
         for (const orphanedTurnId of orphanedTurnIds) {
           yield* offerRuntimeEvent({
             type: "turn.completed",
@@ -349,19 +363,47 @@ export function makeAntigravityAdapter(
           });
         }
         ctx.activeTurnId = undefined;
-        if (ctx.notificationFiber) {
-          yield* Fiber.interrupt(ctx.notificationFiber);
-        }
-        yield* Effect.ignore(Scope.close(ctx.scope, Exit.void));
-        sessions.delete(ctx.threadId);
-        yield* offerRuntimeEvent({
-          type: "session.exited",
-          ...(yield* makeEventStamp()),
-          provider: PROVIDER,
-          threadId: ctx.threadId,
-          payload: { exitKind: "graceful" },
-        });
-      });
+        // Uninterruptible, and after the events above rather than gated on
+        // them: `ctx.stopped` is already true, so a failure or interrupt while
+        // publishing would make every later stop attempt return immediately
+        // and leave the bridge and its `agy` child running for good.
+        yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            if (ctx.notificationFiber) {
+              yield* Effect.ignore(Fiber.interrupt(ctx.notificationFiber));
+            }
+            yield* Effect.ignore(Scope.close(ctx.scope, Exit.void));
+            // Only if this context still owns the slot: a replacement session
+            // may already have been installed while this teardown was closing
+            // a slow child, and deleting it would leak that one's process.
+            if (sessions.get(ctx.threadId) === ctx) {
+              sessions.delete(ctx.threadId);
+            }
+          }),
+        );
+        yield* Effect.ignore(
+          offerRuntimeEvent({
+            type: "session.exited",
+            ...(yield* makeEventStamp()),
+            provider: PROVIDER,
+            threadId: ctx.threadId,
+            payload: { exitKind: "graceful" },
+          }),
+        );
+      }).pipe(
+        // Publication of the shutdown events above is best effort; the process
+        // and registry cleanup underneath it is not optional.
+        Effect.onExit(() =>
+          Effect.uninterruptible(
+            Effect.gen(function* () {
+              yield* Effect.ignore(Scope.close(ctx.scope, Exit.void));
+              if (sessions.get(ctx.threadId) === ctx) {
+                sessions.delete(ctx.threadId);
+              }
+            }),
+          ),
+        ),
+      );
 
     const startSession: AntigravityAdapterShape["startSession"] = (input) =>
       withThreadLock(
@@ -461,6 +503,11 @@ export function makeAntigravityAdapter(
           yield* acp.handleRequestPermission((params) =>
             mapAcpCallbackFailure(
               Effect.gen(function* () {
+                // A request arriving after teardown has no live turn behind it,
+                // so it must not be auto-approved on the way out.
+                if (ctx?.stopped) {
+                  return { outcome: { outcome: "cancelled" } as const };
+                }
                 if (input.runtimeMode === "full-access") {
                   const autoApproved = selectAutoApprovedPermissionOption(params);
                   if (autoApproved !== undefined) {
@@ -468,6 +515,7 @@ export function makeAntigravityAdapter(
                   }
                 }
                 const permissionRequest = parsePermissionRequest(params);
+                const approvalEpoch = ctx?.cancelEpoch;
                 const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
                 const decision = yield* Deferred.make<ProviderApprovalDecision>();
                 const turnId = sessions.get(input.threadId)?.activeTurnId;
@@ -510,8 +558,13 @@ export function makeAntigravityAdapter(
                     decision: resolved,
                   }),
                 );
+                // Re-checked at the moment of answering: an approval decided
+                // while Stop was landing must not come back as an allow.
+                const stillLive = !ctx?.stopped && ctx?.cancelEpoch === approvalEpoch;
                 const optionId =
-                  resolved === "cancel" ? undefined : selectPermissionOptionId(params, resolved);
+                  resolved === "cancel" || !stillLive
+                    ? undefined
+                    : selectPermissionOptionId(params, resolved);
                 return {
                   outcome: optionId
                     ? { outcome: "selected" as const, optionId }
@@ -556,7 +609,8 @@ export function makeAntigravityAdapter(
             activeTurnId: undefined,
             currentModelId: boundModel,
             cancelEpoch: 0,
-            startedTurnIds: new Set(),
+            reservedTurnIds: new Set(),
+            publishedTurnIds: new Set(),
             promptGate: yield* Semaphore.make(1),
             promptsInFlight: 0,
             stopped: false,
@@ -816,9 +870,9 @@ export function makeAntigravityAdapter(
           // unannounced and emit `turn.started` twice. The claim is released
           // again if publication does not happen, so a turn nobody saw start
           // cannot later be completed.
-          const announcing = !ctx.startedTurnIds.has(turnId);
+          const announcing = !ctx.reservedTurnIds.has(turnId);
           if (announcing) {
-            ctx.startedTurnIds.add(turnId);
+            ctx.reservedTurnIds.add(turnId);
           }
           if (announcing) {
             // Stamp generation sits inside the guarded region: it can fail or
@@ -834,11 +888,14 @@ export function makeAntigravityAdapter(
                 turnId,
                 payload: { model: ctx.session.model },
               });
+              // Marked published only once the event is genuinely out, so
+              // teardown never completes a turn that was merely reserved.
+              ctx.publishedTurnIds.add(turnId);
             }).pipe(
               Effect.onExit((exit) =>
                 Exit.isSuccess(exit)
                   ? Effect.void
-                  : Effect.sync(() => ctx.startedTurnIds.delete(turnId)),
+                  : Effect.sync(() => ctx.reservedTurnIds.delete(turnId)),
               ),
             );
           }
@@ -852,15 +909,26 @@ export function makeAntigravityAdapter(
                 if (ctx.cancelEpoch !== acceptedEpoch || ctx.stopped) {
                   return undefined;
                 }
-                const response = yield* ctx.acp.prompt({ prompt: promptParts });
                 // The bridge writes its `session/update` notifications before
                 // the prompt response, but the runtime only queues them.
                 // Draining inside the gate keeps the turn from settling — and
                 // its id from being cleared — while content, tool and item
                 // events are still pending, which would leave them
                 // unattributed or attributed to the next turn.
-                yield* ctx.acp.drainEvents;
-                return response;
+                //
+                // Bounded and best-effort: the drain waits on the notification
+                // consumer, and stop interrupts that consumer, so an unbounded
+                // wait here would strand this fiber holding the gate forever.
+                // Losing the ordering guarantee is recoverable; a permanent
+                // hang is not. The error path drains too — a nonzero `agy`
+                // exit still emits final updates before its response.
+                const drain = Effect.ignore(
+                  Effect.timeoutOption(ctx.acp.drainEvents, EVENT_DRAIN_TIMEOUT_MS),
+                );
+                return yield* ctx.acp.prompt({ prompt: promptParts }).pipe(
+                  Effect.tapCause(() => drain),
+                  Effect.tap(() => drain),
+                );
               }),
             )
             .pipe(
@@ -918,8 +986,9 @@ export function makeAntigravityAdapter(
               // Read from shared state rather than this call's local flag: the
               // prompt that published `turn.started` may not be the one that
               // settles the turn, and the settler still owes the completion.
-              const published = ctx.startedTurnIds.has(turnId);
-              ctx.startedTurnIds.delete(turnId);
+              const published = ctx.publishedTurnIds.has(turnId);
+              ctx.publishedTurnIds.delete(turnId);
+              ctx.reservedTurnIds.delete(turnId);
               // The public session field is what `listSessions` and the reaper
               // read, so leaving it set would advertise a turn that has ended.
               if (ctx.session.activeTurnId === turnId) {
@@ -1057,11 +1126,13 @@ export function makeAntigravityAdapter(
         return c !== undefined && !c.stopped;
       });
 
+    // Snapshotted, not iterated live: teardown deletes from this map, and a
+    // concurrent `startSession` can install a replacement mid-sweep.
     const stopAll: AntigravityAdapterShape["stopAll"] = () =>
-      Effect.forEach(sessions.values(), stopSessionInternal, { discard: true });
+      Effect.forEach(Array.from(sessions.values()), stopSessionInternal, { discard: true });
 
     yield* Effect.addFinalizer(() =>
-      Effect.forEach(sessions.values(), stopSessionInternal, { discard: true }).pipe(
+      Effect.forEach(Array.from(sessions.values()), stopSessionInternal, { discard: true }).pipe(
         Effect.catch((cause) =>
           Effect.logError("Failed to emit Antigravity session shutdown event.", { cause }),
         ),

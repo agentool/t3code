@@ -438,6 +438,8 @@ function requestToolApproval(input: {
   }
   const toolCall = input.payload.toolCall;
   const stepIdx = typeof input.payload.stepIdx === "number" ? input.payload.stepIdx : 0;
+  // An allow decided while Stop was landing must not be written as an allow.
+  const requestedAtGeneration = cancelGeneration(input.sessionId);
   void sendRequest(
     "session/request_permission",
     {
@@ -463,7 +465,13 @@ function requestToolApproval(input: {
     APPROVAL_WAIT_MS,
   )
     .then((result) => {
-      const decision = approvalOutcomeToDecision(result, [APPROVE_OPTION, APPROVE_SESSION_OPTION]);
+      const decision =
+        cancelGeneration(input.sessionId) !== requestedAtGeneration
+          ? ({
+              decision: "deny",
+              reason: "Cancelled before this tool was approved",
+            } satisfies AgyHookDecision)
+          : approvalOutcomeToDecision(result, [APPROVE_OPTION, APPROVE_SESSION_OPTION]);
       if (decision.decision === "allow" && selectedOptionId(result) === APPROVE_SESSION_OPTION) {
         sessionWideApprovals.add(input.sessionId);
       }
@@ -584,6 +592,12 @@ async function awaitDecision(hookDir: string, hookName: string): Promise<AgyHook
       }
     } catch {
       // Not written yet, or written partially; try again.
+    }
+    if (!NodeFS.existsSync(hookDir)) {
+      // The turn is over and its directory reclaimed, so no decision can ever
+      // land here. Stop waiting rather than polling a path that will not come
+      // back.
+      return { decision: "deny", reason: "Antigravity turn ended before approval" };
     }
     await new Promise((resolve) => setTimeout(resolve, APPROVAL_POLL_INTERVAL_MS));
   }
@@ -847,20 +861,24 @@ function drain(input: {
     }
     // The hook process is blocked until a decision file appears, so this has
     // to be started for every announced tool call.
-    // Not during the final drain: the child has already exited, so no tool is
-    // waiting on the answer and the request would never be settled.
-    if (
-      !input.final &&
-      approvalRequired() &&
-      hook.event === "pre-tool-use" &&
-      hook.payload?.toolCall
-    ) {
-      requestToolApproval({
-        sessionId: input.sessionId,
-        hookDir: input.hookDir,
-        hookName: name,
-        payload: hook.payload,
-      });
+    if (approvalRequired() && hook.event === "pre-tool-use" && hook.payload?.toolCall) {
+      if (input.final) {
+        // The child has exited, so nothing will consume an approval — but the
+        // hook subprocess may still be polling, and its directory is about to
+        // be removed. Deny explicitly so it stops now instead of spinning until
+        // its own timeout with no possible answer.
+        writeDecision(input.hookDir, name, {
+          decision: "deny",
+          reason: "Antigravity turn ended before this tool was approved",
+        });
+      } else {
+        requestToolApproval({
+          sessionId: input.sessionId,
+          hookDir: input.hookDir,
+          hookName: name,
+          payload: hook.payload,
+        });
+      }
     }
   }
 
