@@ -423,7 +423,16 @@ export function makeAntigravityAdapter(
         }),
       );
 
-    const stopSessionInternal = (ctx: AntigravitySessionContext) =>
+    const stopSessionInternal = (
+      ctx: AntigravitySessionContext,
+      /**
+       * Stop only while this turn is still the active one. Used by the
+       * cancel-acknowledgement fallback, whose decision to stop was made ten
+       * seconds earlier: without rechecking under the gate, a turn that settled
+       * in the meantime would take its replacement down with it.
+       */
+      onlyIfActiveTurn?: TurnId,
+    ) =>
       Effect.gen(function* () {
         // Claiming the stop, snapshotting what was published, and clearing the
         // active turn happen under the lifecycle gate so they cannot interleave
@@ -431,6 +440,9 @@ export function makeAntigravityAdapter(
         const orphanedTurnIds = yield* ctx.lifecycleGate.withPermit(
           Effect.sync(() => {
             if (ctx.stopped) {
+              return undefined;
+            }
+            if (onlyIfActiveTurn !== undefined && ctx.activeTurnId !== onlyIfActiveTurn) {
               return undefined;
             }
             ctx.stopped = true;
@@ -1361,15 +1373,18 @@ export function makeAntigravityAdapter(
           yield* Effect.forkIn(
             Effect.sleep(CANCEL_ACK_TIMEOUT_MS).pipe(
               Effect.flatMap(() =>
-                ctx.activeTurnId !== cancelledTurnId
-                  ? Effect.void
-                  : // Still running this long after a cancel means the bridge is
-                    // not processing notifications. Interrupting the RPC alone
-                    // would settle the turn here while a detached `agy` kept
-                    // running tools, so the session goes instead: closing its
-                    // scope ends the bridge process, whose own exit handler
-                    // kills the `agy` process group.
-                    Effect.ignore(stopSessionInternal(ctx)),
+                // Still running this long after a cancel means the bridge is
+                // not processing notifications. Interrupting the RPC alone
+                // would settle the turn here while a detached `agy` kept
+                // running tools, so the session goes instead: closing its scope
+                // ends the bridge process, whose own exit handler kills the
+                // `agy` process group.
+                //
+                // The turn is named rather than checked here: this fiber woke
+                // ten seconds late, and the check has to happen under the same
+                // gate that claims the stop or a turn that settled meanwhile
+                // takes its replacement down with it.
+                Effect.ignore(stopSessionInternal(ctx, cancelledTurnId)),
               ),
             ),
             ctx.scope,
