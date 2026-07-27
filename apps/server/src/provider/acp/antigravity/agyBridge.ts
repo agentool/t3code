@@ -282,25 +282,26 @@ function writeMessage(value: unknown): void {
  * finalization between transcript drain passes. Its own listener continues to
  * clear `stdoutBlocked`, including when no turn is currently waiting here.
  */
-function waitForStdoutDrain(deadline: number): Promise<void> {
+function waitForStdoutDrain(deadline: number): Promise<boolean> {
   if (!stdoutBlocked) {
-    return Promise.resolve();
+    return Promise.resolve(false);
   }
   const remaining = deadline - Date.now();
   if (remaining <= 0) {
-    return Promise.resolve();
+    return Promise.resolve(stdoutBlocked);
   }
   return new Promise((resolve) => {
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const finish = () => {
-      process.stdout.off("drain", finish);
+    const finish = (timedOut: boolean) => {
+      process.stdout.off("drain", onDrain);
       if (timer) {
         clearTimeout(timer);
       }
-      resolve();
+      resolve(timedOut);
     };
-    process.stdout.once("drain", finish);
-    timer = setTimeout(finish, remaining);
+    const onDrain = () => finish(false);
+    process.stdout.once("drain", onDrain);
+    timer = setTimeout(() => finish(stdoutBlocked), remaining);
   });
 }
 
@@ -1857,7 +1858,10 @@ async function runTurn(
   let finalPasses = 0;
   let transcriptRemains = true;
   while (transcriptRemains && finalPasses < MAX_FINAL_DRAIN_PASSES) {
-    await waitForStdoutDrain(stdoutDrainDeadline);
+    const stdoutDrainTimedOut = await waitForStdoutDrain(stdoutDrainDeadline);
+    if (stdoutDrainTimedOut) {
+      break;
+    }
     transcriptRemains = drain({
       sessionId,
       hookDir,
