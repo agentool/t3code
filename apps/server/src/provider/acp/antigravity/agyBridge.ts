@@ -48,6 +48,7 @@ import {
   dropPriorTurnRecords,
   MAX_TRANSCRIPT_LINE_CHARS,
   parseTranscriptLine,
+  serializedTranscriptRecordSize,
   transcriptRecordUpdates,
 } from "./agyTranscript.ts";
 
@@ -65,9 +66,13 @@ const APPROVAL_HOOK_TIMEOUT_SECONDS = 11 * 60;
 const APPROVAL_POLL_INTERVAL_MS = 50;
 /** Grace period before a cancelled process group is killed outright. */
 const KILL_ESCALATION_MS = 5_000;
+/** Backstop when a child reports `error` but never follows it with `close`. */
+const CHILD_ERROR_CLOSE_GRACE_MS = KILL_ESCALATION_MS + 1_000;
 /** Secret shared with hook processes so a decision cannot be forged. */
 const HOOK_SECRET_ENV = "T3_AGY_HOOK_SECRET";
 const HOOK_POLL_INTERVAL_MS = 50;
+/** Total finalization time allowed for stdout to recover from backpressure. */
+const STDOUT_DRAIN_GRACE_MS = 1_000;
 /**
  * Drains a transcript record waits for the hook that would announce its tool
  * call. Twenty polls is a second — long enough for a hook that is merely late,
@@ -268,6 +273,35 @@ function writeMessage(value: unknown): void {
       stdoutBlocked = false;
     });
   }
+}
+
+/**
+ * Wait for stdout to accept more data, but never past the finalization budget.
+ *
+ * `writeMessage` remains synchronous: this wait is used only by async turn
+ * finalization between transcript drain passes. Its own listener continues to
+ * clear `stdoutBlocked`, including when no turn is currently waiting here.
+ */
+function waitForStdoutDrain(deadline: number): Promise<void> {
+  if (!stdoutBlocked) {
+    return Promise.resolve();
+  }
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = () => {
+      process.stdout.off("drain", finish);
+      if (timer) {
+        clearTimeout(timer);
+      }
+      resolve();
+    };
+    process.stdout.once("drain", finish);
+    timer = setTimeout(finish, remaining);
+  });
 }
 
 function sendResult(id: unknown, result: unknown): void {
@@ -1401,9 +1435,22 @@ function drain(input: {
     // Records held from an earlier pass go first: their hook may have arrived
     // since, and they are older than anything read just now.
     const carried = input.state.deferredRecords.splice(0, input.state.deferredRecords.length);
+    let remainingRecordChars = input.state.deferredRecordChars;
+    input.state.deferredRecordChars = 0;
     const records = [
       ...carried,
-      ...allLines.map((line) => parseTranscriptLine(line)).filter((r) => r !== null),
+      ...allLines.flatMap((line) => {
+        const record = parseTranscriptLine(line);
+        if (record === null) {
+          return [];
+        }
+        const deferred = {
+          record,
+          serializedChars: serializedTranscriptRecordSize(record),
+        };
+        remainingRecordChars += deferred.serializedChars;
+        return [deferred];
+      }),
     ];
 
     // A deferral is a barrier, not a skip: everything after it is held too.
@@ -1420,24 +1467,28 @@ function drain(input: {
     // would discard a record read moments ago that has had no chance at all.
     const agedHead = carried.length > 0 && input.state.deferredDrains >= MAX_DEFERRED_DRAINS;
     for (let index = 0; index < records.length; index += 1) {
-      const record = records[index];
-      if (record === undefined) {
+      const deferredRecord = records[index];
+      if (deferredRecord === undefined) {
         continue;
       }
+      const record = deferredRecord.record;
       const result = transcriptRecordUpdates(record, input.state);
       if (!result.deferred) {
         // Something matched, so whatever was blocking the queue has cleared.
         input.state.deferredDrains = 0;
       } else if (input.final) {
         // Nothing further is coming; holding it would only lose it silently.
+        remainingRecordChars -= deferredRecord.serializedChars;
         continue;
       } else if (index === 0 && agedHead) {
         // Waited its full budget with no hook. Drop just this one and let the
         // rest of the batch start over with a fresh budget.
         input.state.deferredDrains = 0;
+        remainingRecordChars -= deferredRecord.serializedChars;
         continue;
       } else {
         held.push(...records.slice(index).filter((entry) => entry !== undefined));
+        input.state.deferredRecordChars = remainingRecordChars;
         input.state.deferredDrains += 1;
         // Aged out one at a time, but refilled by every poll. Antigravity emits
         // internal steps far faster than one record per drain interval, so on a
@@ -1448,7 +1499,7 @@ function drain(input: {
         // unmatchable one may have had its own hook arrive in the meantime, and
         // dropping it unexamined would lose that tool's output for good. Each is
         // offered again on the way out; only those still unmatched are dropped.
-        let heldChars = held.reduce((total, entry) => total + (entry.content?.length ?? 0), 0);
+        let heldChars = input.state.deferredRecordChars;
         let trimmed = false;
         while (held.length > MAX_DEFERRED_RECORDS || heldChars > MAX_DEFERRED_CHARS) {
           const candidate = held.shift();
@@ -1456,14 +1507,14 @@ function drain(input: {
             break;
           }
           trimmed = true;
-          heldChars -= candidate.content?.length ?? 0;
-          const retried = transcriptRecordUpdates(candidate, input.state);
+          heldChars -= candidate.serializedChars;
+          const retried = transcriptRecordUpdates(candidate.record, input.state);
           if (retried.deferred) {
             continue;
           }
           for (const update of retried.updates) {
             bufferedUpdates.push({
-              stepIdx: candidate.step_index,
+              stepIdx: candidate.record.step_index,
               phase: "transcript",
               update,
             });
@@ -1471,7 +1522,7 @@ function drain(input: {
           if (retried.emittedAssistantText) {
             input.assistantText.emitted = true;
           }
-          const retriedStep = candidate.step_index;
+          const retriedStep = candidate.record.step_index;
           if (typeof retriedStep === "number") {
             const terminal = takeTerminal(input.state, retriedStep);
             if (terminal) {
@@ -1483,6 +1534,7 @@ function drain(input: {
             }
           }
         }
+        input.state.deferredRecordChars = heldChars;
         if (trimmed) {
           // The head that had been accruing age is gone, so its budget must not
           // carry over to whatever is now in front — that record would expire
@@ -1513,6 +1565,7 @@ function drain(input: {
           });
         }
       }
+      remainingRecordChars -= deferredRecord.serializedChars;
     }
   }
 
@@ -1737,9 +1790,9 @@ async function runTurn(
   });
 
   const poller = setInterval(() => {
-    // Skipped rather than queued behind a reader that is already behind. Only
-    // the interval pauses: the final drain below runs regardless, so a turn
-    // ending while stdout is congested still reports everything it owes.
+    // Skipped rather than queued behind a reader that is already behind.
+    // `writeMessage` clears the flag on `drain`, so a later interval resumes
+    // only after stdout has accepted its buffered data.
     if (stdoutBlocked) {
       return;
     }
@@ -1759,6 +1812,18 @@ async function runTurn(
 
   let childError: Error | undefined;
   const exitCode = await new Promise<number | null>((resolve) => {
+    let settled = false;
+    let missingCloseTimer: ReturnType<typeof setTimeout> | undefined;
+    const settle = (code: number | null) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (missingCloseTimer) {
+        clearTimeout(missingCloseTimer);
+      }
+      resolve(code);
+    };
     child.on("error", (error) => {
       childError = error;
       // An error can report a failed kill while the process is still alive.
@@ -1772,8 +1837,13 @@ async function runTurn(
       ) {
         killActiveChild();
       }
+      // Node normally follows `error` with `close`, including failed spawns.
+      // Keep that path intact, but do not let a platform/runtime that omits
+      // `close` pin the turn and its temp directories forever. The grace
+      // outlasts the ordinary process-group escalation above.
+      missingCloseTimer ??= setTimeout(() => settle(child.exitCode), CHILD_ERROR_CLOSE_GRACE_MS);
     });
-    child.once("close", (code) => resolve(code));
+    child.once("close", settle);
   });
 
   clearInterval(poller);
@@ -1783,9 +1853,11 @@ async function runTurn(
   // transcript needs several. Only the last one runs as `final`: flushing the
   // cursor while bytes remain would emit a half-written record as if it were
   // whole, and leave the rest of that line to be read as a fragment.
+  const stdoutDrainDeadline = Date.now() + STDOUT_DRAIN_GRACE_MS;
   let finalPasses = 0;
   let transcriptRemains = true;
   while (transcriptRemains && finalPasses < MAX_FINAL_DRAIN_PASSES) {
+    await waitForStdoutDrain(stdoutDrainDeadline);
     transcriptRemains = drain({
       sessionId,
       hookDir,
@@ -1806,6 +1878,7 @@ async function runTurn(
     // in silence, so the partial line is dropped and the shortfall is said out
     // loud instead.
     cursor.flush();
+    await waitForStdoutDrain(stdoutDrainDeadline);
     sendSessionUpdate(sessionId, {
       sessionUpdate: "agent_message_chunk",
       content: {
@@ -1814,6 +1887,7 @@ async function runTurn(
       },
     });
   }
+  await waitForStdoutDrain(stdoutDrainDeadline);
   drain({
     sessionId,
     hookDir,

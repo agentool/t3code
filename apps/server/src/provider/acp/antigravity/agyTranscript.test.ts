@@ -7,6 +7,7 @@ import {
   MAX_TRANSCRIPT_LINE_CHARS,
   normalizeToolOutput,
   parseTranscriptLine,
+  serializedTranscriptRecordSize,
   transcriptRecordUpdates,
 } from "./agyTranscript.ts";
 
@@ -33,6 +34,20 @@ describe("parseTranscriptLine", () => {
       step_index: 2,
       type: "PLANNER_RESPONSE",
     });
+  });
+
+  it("sizes the complete parsed record rather than only string content", () => {
+    const record = parseTranscriptLine(
+      JSON.stringify({
+        step_index: 2,
+        type: "RUN_COMMAND",
+        content: { summary: "small" },
+        metadata: { payload: "x".repeat(4_096) },
+      }),
+    );
+
+    expect(record).not.toBeNull();
+    expect(serializedTranscriptRecordSize(record!)).toBeGreaterThan(4_096);
   });
 });
 

@@ -228,7 +228,14 @@ export interface AgyTurnState {
    * it to. The transcript is consumed once by byte offset, so these are held
    * rather than dropped and retried on the next pass.
    */
-  readonly deferredRecords: Array<AgyTranscriptRecordLike>;
+  readonly deferredRecords: Array<AgyDeferredTranscriptRecord>;
+  /**
+   * Serialized size of `deferredRecords`.
+   *
+   * Maintained as entries enter and leave the queue so enforcing the aggregate
+   * cap does not have to rescan every retained record on every drain pass.
+   */
+  deferredRecordChars: number;
   /**
    * Drains the held records have waited. Antigravity emits unpaired steps for
    * its own internal work, so a record whose hook is never coming must not
@@ -264,6 +271,7 @@ export function makeAgyTurnState(conversationId?: string): AgyTurnState {
     pendingTerminal: new Map(),
     transcriptSeenSteps: new Set(),
     deferredRecords: [],
+    deferredRecordChars: 0,
     deferredDrains: 0,
     conversationId,
     transcriptPath: undefined,
@@ -280,6 +288,12 @@ export interface AgyTranscriptRecordLike {
   readonly step_index?: number;
   readonly type?: string;
   readonly content?: string;
+}
+
+/** A retained transcript record and its one-time complete serialized size. */
+export interface AgyDeferredTranscriptRecord {
+  readonly record: AgyTranscriptRecordLike;
+  readonly serializedChars: number;
 }
 
 /** A `session/update` payload, shaped for ACP but kept as plain JSON. */

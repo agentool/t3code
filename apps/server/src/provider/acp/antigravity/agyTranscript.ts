@@ -64,6 +64,16 @@ export function parseTranscriptLine(line: string): AgyTranscriptRecord | null {
 }
 
 /**
+ * Size of the complete parsed record retained by the bridge.
+ *
+ * Computed once when a record enters the deferred queue; callers carry the
+ * result with the record instead of repeatedly serializing held entries.
+ */
+export function serializedTranscriptRecordSize(record: AgyTranscriptRecord): number {
+  return JSON.stringify(record).length;
+}
+
+/**
  * Strip the `Created At:` / `Completed At:` preamble Antigravity prepends to
  * tool records, then dedent. Tool output arrives indented with tabs, which
  * would otherwise render as a code block in the client.

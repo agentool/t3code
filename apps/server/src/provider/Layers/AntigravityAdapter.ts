@@ -1403,11 +1403,16 @@ export function makeAntigravityAdapter(
                       // minute deadline, unanswerable, with the turn already
                       // reported complete.
                       //
-                      // Done before `activeTurnId` is cleared so the handlers see
-                      // the state they were opened against, and awaited — with a
-                      // bound, because a handler that never finishes must not
-                      // strand the turn — so `request.resolved` is published
-                      // before the completion below.
+                      // `activeTurnId` is also the approval handler's liveness
+                      // check. Clear the internal claim before releasing any
+                      // decisions so an accept racing this settlement is
+                      // reported as cancelled, matching the bridge token that
+                      // has already been retired. The public session claim is
+                      // kept until the terminal bookkeeping below; nothing in
+                      // the approval wait depends on the internal claim.
+                      if (ctx.activeTurnId === turnId) {
+                        ctx.activeTurnId = undefined;
+                      }
                       const orphanedApprovals = [...ctx.approvals.values()].filter(
                         (approval) => approval.turnId === turnId,
                       );
@@ -1429,14 +1434,6 @@ export function makeAntigravityAdapter(
                             { concurrency: "unbounded" },
                           ).pipe(Effect.timeoutOption(APPROVAL_SETTLE_TIMEOUT_MS)),
                         );
-                      }
-                      // One prompt per turn, so this settles unconditionally.
-                      // Cleared even when the turn never started — a model switch can
-                      // fail after `activeTurnId` is installed, and leaving it set
-                      // advertises a turn to `listSessions` and the reaper that no
-                      // longer exists. Only the event below depends on having started.
-                      if (ctx.activeTurnId === turnId) {
-                        ctx.activeTurnId = undefined;
                       }
                       // Read from shared state rather than this call's local flag: the
                       // prompt that published `turn.started` may not be the one that
