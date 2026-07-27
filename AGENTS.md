@@ -64,6 +64,13 @@ Known constraints, all inherent to print mode:
   trajectory, so `rollbackThread` fails rather than silently truncating local state only.
 - `--model` is a per-spawn flag that composes with `--conversation`, so a model switch keeps
   the trajectory and applies from the next turn (`sessionModelSwitch: "in-session"`).
+- Cancelling a turn kills `agy`'s whole process group, not just `agy`: tools it started
+  otherwise keep writing to the workspace after Stop. The group is owned from spawn and
+  reaped when the leader exits, which is the last moment the group id is certainly still
+  ours — a delayed signal to a bare group id can land on whatever the OS recycled it onto.
+  On Windows there are no process groups; `taskkill /T` covers the tree while the leader
+  lives, but a tool that outlives its leader there cannot be reaped without a Job Object,
+  which needs a native addon.
 - Any `agy` subcommand spawned for a probe must set `stdin: "ignore"`. `agy` starts a language
   server and will not emit output while stdin stays open, so the default `"pipe"` hangs it.
 

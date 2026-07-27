@@ -991,6 +991,38 @@ function signalGroupOf(
   }
 }
 
+/**
+ * Take ownership of a freshly spawned child's process group.
+ *
+ * Attached at spawn, not when cancelling. Registering it later loses the race
+ * where the leader has already exited — the handler would never fire, and the
+ * timed backstop skips a leader it can see is gone — leaving anything the
+ * leader started alive with nothing tracking it.
+ *
+ * The group is killed when the leader exits, whatever the reason. A turn's
+ * tools have no business outliving the turn, and this is the last moment the
+ * group id is certainly still ours.
+ */
+function ownChildGroup(child: NodeChildProcess.ChildProcess, pid: number): void {
+  child.once("exit", () => {
+    if (process.platform === "win32") {
+      // Best effort only: once the leader pid is gone `taskkill /T` has no tree
+      // left to walk. Reliably reaping survivors here needs a Job Object, which
+      // is not reachable without a native addon.
+      try {
+        NodeChildProcess.execFileSync("taskkill", ["/pid", String(pid), "/T", "/F"], {
+          stdio: "ignore",
+        });
+      } catch {
+        // Nothing left, or nothing we can do.
+      }
+    } else {
+      signalGroupOf(child, pid, "SIGKILL");
+    }
+    clearPendingKill(child);
+  });
+}
+
 function clearPendingKill(child: NodeChildProcess.ChildProcess): void {
   const pending = pendingKills.get(child);
   if (pending?.timer) {
@@ -1041,20 +1073,17 @@ function killActiveChild(options?: { readonly immediate?: boolean }): void {
     // second timer would be another delayed signal nobody cancels.
     return;
   }
+  if (child.exitCode !== null || child.signalCode !== null) {
+    // Leader already gone: the spawn-time handler has this, or has run.
+    signalGroupOf(child, pid, "SIGKILL");
+    return;
+  }
   signalGroupOf(child, pid, "SIGTERM");
   const pending: { readonly pid: number; timer?: ReturnType<typeof setTimeout> } = { pid };
   pendingKills.set(child, pending);
-  // `agy` can die on SIGTERM while a tool it started ignores it and keeps the
-  // group busy. Killing at that moment is what makes the group id safe to use:
-  // it belongs to us while any member lives, and this runs the instant the
-  // leader goes rather than seconds later, when the number may have been
-  // recycled onto something unrelated.
-  child.once("exit", () => {
-    if (pendingKills.get(child) === pending) {
-      signalGroupOf(child, pid, "SIGKILL");
-      clearPendingKill(child);
-    }
-  });
+  // The group is killed when the leader exits by the handler installed at
+  // spawn, so nothing needs attaching here.
+  //
   // Backstop for a leader that ignores SIGTERM outright. Safe to target by
   // group, because the leader is by definition still alive if this fires.
   const escalation = setTimeout(() => {
@@ -1401,6 +1430,11 @@ async function runTurn(
   activeTurnEpoch = promptEpoch;
   activeTurnToken = turnToken;
   activeChild = child;
+  if (child.pid !== undefined) {
+    // Owned from the moment it exists, so nothing it spawns can outlive it
+    // unnoticed.
+    ownChildGroup(child, child.pid);
+  }
   // A cancel during startup had no process to signal; deliver it now.
   if (cancelledSessions.has(sessionId)) {
     killActiveChild();
