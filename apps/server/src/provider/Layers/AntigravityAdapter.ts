@@ -183,7 +183,16 @@ interface AntigravitySessionContext {
    * Number of prompts in flight. >0 means a turn is running, so a new
    * sendTurn steers the existing turn rather than opening a new one.
    */
-  promptsInFlight: number;
+  /**
+   * Prompts still in flight, counted per turn rather than per session.
+   *
+   * A shared counter breaks as soon as two turns overlap, which epoch-scoped
+   * steering makes possible: a prompt sent after a Stop opens its own turn
+   * while the cancelled one is still settling. Whichever finished first would
+   * see the other's prompt in the count, decide it was not the last, and skip
+   * its terminal event — orphaning that turn.
+   */
+  readonly promptsInFlightByTurn: Map<TurnId, number>;
   stopped: boolean;
 }
 
@@ -430,6 +439,9 @@ export function makeAntigravityAdapter(
             const claimed = [...ctx.publishedTurnIds];
             ctx.publishedTurnIds.clear();
             ctx.reservedTurnIds.clear();
+            // Counts go with the turns they belonged to; a finalizer waking
+            // later finds nothing outstanding and settles nothing.
+            ctx.promptsInFlightByTurn.clear();
             ctx.activeTurnId = undefined;
             return claimed;
           }),
@@ -696,7 +708,7 @@ export function makeAntigravityAdapter(
             approvals: pendingApprovals,
             acpSessionId: started.sessionId,
             activeTurnEpoch: -1,
-            promptsInFlight: 0,
+            promptsInFlightByTurn: new Map(),
             stopped: false,
           };
 
@@ -901,7 +913,8 @@ export function makeAntigravityAdapter(
         // folds into the ongoing work, so the active turn id is reused.
         //
         // The id is minted first, before anything is read, so that reading
-        // `promptsInFlight` and claiming it are one synchronous step. Yielding
+        // the turn's prompt count and claiming it are one synchronous step.
+        // Yielding
         // between the two — which generating the id here used to do — let two
         // concurrent calls both observe zero and open rival turns over the
         // same thread.
@@ -909,15 +922,16 @@ export function makeAntigravityAdapter(
         // Same epoch only: a prompt accepted after a Stop must not fold into the
         // turn that Stop cancelled, or it would inherit its id and publish a
         // completion for it while the cancelled one is still settling.
+        const activeTurnBusy =
+          ctx.activeTurnId !== undefined &&
+          (ctx.promptsInFlightByTurn.get(ctx.activeTurnId) ?? 0) > 0;
         const steeringTurnId =
-          ctx.promptsInFlight > 0 && ctx.activeTurnEpoch === acceptedEpoch
-            ? ctx.activeTurnId
-            : undefined;
+          activeTurnBusy && ctx.activeTurnEpoch === acceptedEpoch ? ctx.activeTurnId : undefined;
         const turnId = steeringTurnId ?? freshTurnId;
         // Claimed together, without an intervening yield: assigning the active
-        // turn id later let a concurrent call see `promptsInFlight > 0` with no
+        // turn id later let a concurrent call see a busy turn with no
         // id yet and open a rival turn.
-        ctx.promptsInFlight += 1;
+        ctx.promptsInFlightByTurn.set(turnId, (ctx.promptsInFlightByTurn.get(turnId) ?? 0) + 1);
         ctx.activeTurnId = turnId;
         ctx.activeTurnEpoch = acceptedEpoch;
         // Terminal-event bookkeeping. Publication happens in exactly one place
@@ -1100,8 +1114,14 @@ export function makeAntigravityAdapter(
               // Decrement and the last-prompt test are one synchronous step, so
               // a steer arriving mid-settlement cannot make two prompts both
               // believe they own the turn and publish a terminal event each.
-              const remaining = Math.max(0, ctx.promptsInFlight - 1);
-              ctx.promptsInFlight = remaining;
+              // Scoped to this turn: another turn's prompts must not keep this
+              // one from settling, nor settle it on their behalf.
+              const remaining = Math.max(0, (ctx.promptsInFlightByTurn.get(turnId) ?? 1) - 1);
+              if (remaining > 0) {
+                ctx.promptsInFlightByTurn.set(turnId, remaining);
+              } else {
+                ctx.promptsInFlightByTurn.delete(turnId);
+              }
               if (remaining > 0) {
                 return;
               }
@@ -1142,8 +1162,8 @@ export function makeAntigravityAdapter(
                 payload: { state, stopReason },
               });
               // `catchCause` rather than `catch`: a defect while stamping or
-              // publishing would otherwise escape after `promptsInFlight` was
-              // already decremented, stranding the turn as running.
+              // publishing would otherwise escape after the turn's prompt count
+              // was already decremented, stranding the turn as running.
             }).pipe(Effect.catchCause(() => Effect.void)),
           ),
         );

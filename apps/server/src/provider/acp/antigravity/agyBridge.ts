@@ -854,8 +854,13 @@ function promptEpochOf(params: Record<string, unknown>): number | undefined {
   const epoch = isRecord(t3) ? t3["epoch"] : undefined;
   return typeof epoch === "number" ? epoch : undefined;
 }
-/** Cancel epoch of the turn currently running, so a fence can reach it. */
-let activeTurnEpoch = -1;
+/**
+ * Cancel epoch of the turn currently running, or undefined when its prompt
+ * carried no epoch. An untagged client is not using the extension, so it keeps
+ * plain `session/cancel` semantics rather than being scoped by a mark it never
+ * contributes to.
+ */
+let activeTurnEpoch: number | undefined;
 /** Token of that turn, retired when its epoch is cancelled. */
 let activeTurnToken: TurnToken | undefined;
 
@@ -1055,7 +1060,7 @@ async function runTurn(
   sessionId: string,
   session: BridgeSession,
   prompt: RenderedPrompt,
-  promptEpoch: number,
+  promptEpoch: number | undefined,
 ): Promise<TurnOutcome> {
   // A cancel that raced the end of an earlier turn must not decide this one.
   cancelledSessions.delete(sessionId);
@@ -1196,7 +1201,7 @@ async function runTurn(
   // now resolves to a denial rather than writing into a vanishing directory or
   // banking a blanket approval for the next turn.
   turnToken.live = false;
-  activeTurnEpoch = -1;
+  activeTurnEpoch = undefined;
   activeTurnToken = undefined;
   cleanupDir(hookDir);
   cleanupDir(hookWorkspace);
@@ -1324,8 +1329,12 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
       // Compared against the session's cancelled high-water mark. A cancel
       // that outran this prompt raised that mark, and anything the user sends
       // afterwards carries a higher epoch and is unaffected.
-      const promptEpoch = promptEpochOf(params) ?? 0;
-      if (promptEpoch <= cancelledThrough(sessionId)) {
+      //
+      // A prompt without an epoch is from a client that does not send fences,
+      // so there is no mark it could be measured against — refusing it would
+      // reject every prompt such a client ever sends once a mark exists.
+      const promptEpoch = promptEpochOf(params);
+      if (promptEpoch !== undefined && promptEpoch <= cancelledThrough(sessionId)) {
         // Cancelled before it could start; never spawn `agy` for it.
         sendResult(id, { stopReason: "cancelled" });
         return;
@@ -1358,7 +1367,11 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
       // stop on arrival, so it is stopped here. Retiring the token is what
       // makes an approval still in flight deny, including one the client
       // would auto-approve.
-      if (activeTurnToken?.sessionId === sessionId && activeTurnEpoch <= epoch) {
+      if (
+        activeTurnToken?.sessionId === sessionId &&
+        activeTurnEpoch !== undefined &&
+        activeTurnEpoch <= epoch
+      ) {
         activeTurnToken.live = false;
         cancelledSessions.add(sessionId);
         activeChild?.kill("SIGTERM");
@@ -1372,7 +1385,10 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
         // has been cancelled. A prompt accepted after the fence carries a
         // higher epoch and must survive this notification, which the runtime
         // forks and can therefore deliver late.
-        if (activeTurnEpoch <= cancelledThrough(sessionId)) {
+        //
+        // An untagged turn has no epoch to scope by, so it is cancelled
+        // outright — that is the plain ACP behaviour its client expects.
+        if (activeTurnEpoch === undefined || activeTurnEpoch <= cancelledThrough(sessionId)) {
           cancelledSessions.add(sessionId);
           activeChild?.kill("SIGTERM");
         }
