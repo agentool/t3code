@@ -86,6 +86,11 @@ export interface TranscriptUpdateResult {
   readonly updates: ReadonlyArray<AgySessionUpdate>;
   /** True when the record produced assistant-visible text. */
   readonly emittedAssistantText: boolean;
+  /**
+   * True when the record belongs to a tool call that has not been announced
+   * yet. The caller should hold it and try again after reading more hooks.
+   */
+  readonly deferred?: boolean;
 }
 
 /**
@@ -130,17 +135,22 @@ export function transcriptRecordUpdates(
   if (typeof stepIndex !== "number") {
     return { updates: [], emittedAssistantText: false };
   }
-  // Recorded before the early returns below: the transcript is read once by
-  // byte offset, so "this step's record has gone by" holds even when it
-  // carried nothing worth emitting.
-  state.transcriptSeenSteps.add(stepIndex);
   // Completed calls stay in the map precisely so this lookup still resolves:
   // a fast tool's `PostToolUse` hook and its transcript record routinely land
   // in the same drain pass, and hooks are read first.
   const active = state.toolCalls.get(stepIndex);
   if (!active) {
-    return { updates: [], emittedAssistantText: false };
+    // The hook directory is listed before the transcript is read, so a tool
+    // whose `PreToolUse` file appeared in between has a record here and no
+    // call yet. The transcript is consumed once by byte offset, so dropping it
+    // loses that tool's output for good — it is held instead and retried once
+    // the hook shows up.
+    return { updates: [], emittedAssistantText: false, deferred: true };
   }
+  // Recorded only once the record has actually been matched: marking a step
+  // seen before that would tell the caller a tool it has not announced yet is
+  // already finished.
+  state.transcriptSeenSteps.add(stepIndex);
   const output = normalizeToolOutput(content);
   if (output.length === 0) {
     return { updates: [], emittedAssistantText: false };

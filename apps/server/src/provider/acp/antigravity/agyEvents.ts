@@ -213,6 +213,15 @@ export interface AgyTurnState {
    * as running until the turn ended.
    */
   readonly transcriptSeenSteps: Set<number>;
+  /**
+   * Transcript records whose tool call has not been announced yet.
+   *
+   * The hook directory is listed before the transcript is read, so a tool whose
+   * `PreToolUse` file lands in between produces a record with nothing to attach
+   * it to. The transcript is consumed once by byte offset, so these are held
+   * rather than dropped and retried on the next pass.
+   */
+  readonly deferredRecords: Array<AgyTranscriptRecordLike>;
   conversationId: string | undefined;
   transcriptPath: string | undefined;
   /** Transcript file pinned for the turn; see `resolveTranscriptPath`. */
@@ -235,6 +244,7 @@ export function makeAgyTurnState(conversationId?: string): AgyTurnState {
     toolCalls: new Map(),
     pendingTerminal: new Map(),
     transcriptSeenSteps: new Set(),
+    deferredRecords: [],
     conversationId,
     transcriptPath: undefined,
     resolvedTranscriptPath: undefined,
@@ -242,6 +252,13 @@ export function makeAgyTurnState(conversationId?: string): AgyTurnState {
     resumedConversation: conversationId !== undefined,
     modelName: undefined,
   };
+}
+
+/** Minimal shape of a transcript record, kept here to avoid a circular import. */
+export interface AgyTranscriptRecordLike {
+  readonly step_index?: number;
+  readonly type?: string;
+  readonly content?: string;
 }
 
 /** A `session/update` payload, shaped for ACP but kept as plain JSON. */

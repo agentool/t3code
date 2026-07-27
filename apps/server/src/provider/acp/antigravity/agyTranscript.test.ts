@@ -155,13 +155,36 @@ describe("transcriptRecordUpdates", () => {
     expect(state.transcriptSeenSteps.has(3)).toBe(true);
   });
 
-  it("drops tool output with no announced call rather than inventing one", () => {
-    const result = transcriptRecordUpdates(
-      { step_index: 99, source: "MODEL", type: "RUN_COMMAND", content: "orphan" },
-      makeAgyTurnState(),
-    );
+  it("holds tool output whose call has not been announced yet", () => {
+    // The hook directory is listed before the transcript is read, so a tool
+    // whose PreToolUse file lands in between arrives here first. Dropping it
+    // would lose that output for good — the transcript is read once by offset.
+    const state = makeAgyTurnState();
+    const record = { step_index: 99, source: "MODEL", type: "RUN_COMMAND", content: "orphan" };
 
-    expect(result.updates).toHaveLength(0);
+    const deferredResult = transcriptRecordUpdates(record, state);
+    expect(deferredResult.updates).toHaveLength(0);
+    expect(deferredResult.deferred).toBe(true);
+    expect(state.transcriptSeenSteps.has(99)).toBe(false);
+
+    // Once the hook arrives, replaying the held record attaches its output.
+    hookSessionUpdate(
+      {
+        event: "pre-tool-use",
+        payload: {
+          conversationId: "conversation-1",
+          stepIdx: 99,
+          toolCall: { name: "run_command", args: {} },
+        },
+      },
+      state,
+    );
+    const replayed = transcriptRecordUpdates(record, state);
+    expect(replayed.deferred).toBeUndefined();
+    expect(replayed.updates[0]).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "agy-conversation-1-99",
+    });
   });
 });
 

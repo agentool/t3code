@@ -1048,21 +1048,9 @@ function killActiveChild(options?: { readonly immediate?: boolean }): void {
     return;
   }
   const { pid } = child;
-  if (process.platform === "win32") {
-    // Windows has no process groups to signal; this walks the tree instead.
-    try {
-      NodeChildProcess.execFileSync("taskkill", ["/pid", String(pid), "/T", "/F"], {
-        stdio: "ignore",
-      });
-    } catch {
-      try {
-        child.kill();
-      } catch {
-        // Nothing left to kill.
-      }
-    }
-    return;
-  }
+  // Windows goes through the same guarded helper. A `taskkill` here would run
+  // against a numeric pid with no liveness check, and `close` can lag `exit`
+  // long enough for Windows to have reused it.
   if (options?.immediate) {
     signalGroupOf(child, pid, "SIGKILL");
     clearPendingKill(child);
@@ -1288,12 +1276,23 @@ function drain(input: {
         input.state.transcriptPrimed = true;
       }
     }
-    for (const line of allLines) {
-      const record = parseTranscriptLine(line);
-      if (!record) {
+    // Records held from an earlier pass go first: their hook may have arrived
+    // since, and they are older than anything read just now.
+    const held = input.state.deferredRecords.splice(0, input.state.deferredRecords.length);
+    const records = [
+      ...held,
+      ...allLines.map((line) => parseTranscriptLine(line)).filter((r) => r !== null),
+    ];
+    for (const record of records) {
+      const result = transcriptRecordUpdates(record, input.state);
+      if (result.deferred) {
+        // Its tool call has not been announced yet. On the final pass nothing
+        // more is coming, so holding it would only lose it silently.
+        if (!input.final) {
+          input.state.deferredRecords.push(record);
+        }
         continue;
       }
-      const result = transcriptRecordUpdates(record, input.state);
       for (const update of result.updates) {
         sendSessionUpdate(input.sessionId, update);
       }
