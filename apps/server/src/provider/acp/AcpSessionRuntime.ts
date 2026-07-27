@@ -312,6 +312,7 @@ export const make = (
     const configOptionsRef = yield* Ref.make(sessionConfigOptionsFromSetup(undefined));
     const startStateRef = yield* Ref.make<AcpStartState>({ _tag: "NotStarted" });
     const promptSerializationSemaphore = yield* Semaphore.make(1);
+    const cancellationGenerationRef = yield* Ref.make(0);
     const activePromptFiberRef = yield* Ref.make<
       Option.Option<Fiber.Fiber<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>>
     >(Option.none());
@@ -736,64 +737,77 @@ export const make = (
       getModeState: Ref.get(modeStateRef),
       getConfigOptions: Ref.get(configOptionsRef),
       prompt: (payload) =>
-        promptSerializationSemaphore.withPermit(
-          Effect.gen(function* () {
-            const started = yield* getStartedState;
-            yield* closeActiveAssistantSegment({
-              queue: eventQueue,
-              assistantSegmentRef,
-            });
-            const requestPayload = {
-              sessionId: started.sessionId,
-              ...payload,
-            } satisfies EffectAcpSchema.PromptRequest;
-            const cancelledResponse = {
-              stopReason: "cancelled",
-            } satisfies EffectAcpSchema.PromptResponse;
-            // Sending and publishing the fiber are one step, so a concurrent
-            // cancel either sees no prompt at all or sees this one and can
-            // interrupt it. Uninterruptible because being interrupted between
-            // the two would leave a live RPC nothing can reach.
-            const promptRpcFiber = yield* dispatchGate.withPermit(
-              Effect.uninterruptible(
-                Effect.gen(function* () {
-                  const fiber = yield* runLoggedRequest(
-                    "session/prompt",
-                    requestPayload,
-                    acp.agent.prompt(requestPayload),
-                  ).pipe(Effect.forkIn(runtimeScope));
-                  yield* Ref.set(activePromptFiberRef, Option.some(fiber));
-                  return fiber;
-                }),
-              ),
-            );
-            return yield* Fiber.join(promptRpcFiber).pipe(
-              Effect.catchCause((cause) =>
-                Cause.hasInterruptsOnly(cause)
-                  ? Effect.succeed(cancelledResponse)
-                  : Effect.failCause(cause),
-              ),
-              Effect.ensuring(
-                Effect.gen(function* () {
-                  yield* Fiber.interrupt(promptRpcFiber).pipe(Effect.ignore);
-                  yield* Ref.set(activePromptFiberRef, Option.none());
-                }),
-              ),
-              // Closed however the prompt ends, not only when it succeeds. An
-              // agent that streamed some text and then failed the RPC left its
-              // segment open, and the next prompt closed it on the way in —
-              // after the caller had moved to a new turn, so the `item.completed`
-              // landed on the wrong one. A failed prompt still ends whatever it
-              // was saying.
-              Effect.ensuring(
-                closeActiveAssistantSegment({
-                  queue: eventQueue,
-                  assistantSegmentRef,
-                }),
-              ),
-            );
-          }),
-        ),
+        Effect.gen(function* () {
+          // Captured before waiting for prompt serialization. A cancel that
+          // lands while this prompt is queued moves the generation, so the
+          // prompt can decline instead of reaching the agent after Stop.
+          const cancellationGeneration = yield* Ref.get(cancellationGenerationRef);
+          return yield* promptSerializationSemaphore.withPermit(
+            Effect.gen(function* () {
+              const cancelledResponse = {
+                stopReason: "cancelled",
+              } satisfies EffectAcpSchema.PromptResponse;
+              const started = yield* getStartedState;
+              yield* closeActiveAssistantSegment({
+                queue: eventQueue,
+                assistantSegmentRef,
+              });
+              const requestPayload = {
+                sessionId: started.sessionId,
+                ...payload,
+              } satisfies EffectAcpSchema.PromptRequest;
+              // Sending and publishing the fiber are one step, so a concurrent
+              // cancel either sees no prompt at all or sees this one and can
+              // interrupt it. Uninterruptible because being interrupted between
+              // the two would leave a live RPC nothing can reach.
+              const promptRpcFiber = yield* dispatchGate.withPermit(
+                Effect.uninterruptible(
+                  Effect.gen(function* () {
+                    const currentGeneration = yield* Ref.get(cancellationGenerationRef);
+                    if (currentGeneration !== cancellationGeneration) {
+                      return Option.none();
+                    }
+                    const fiber = yield* runLoggedRequest(
+                      "session/prompt",
+                      requestPayload,
+                      acp.agent.prompt(requestPayload),
+                    ).pipe(Effect.forkIn(runtimeScope));
+                    yield* Ref.set(activePromptFiberRef, Option.some(fiber));
+                    return Option.some(fiber);
+                  }),
+                ),
+              );
+              if (Option.isNone(promptRpcFiber)) {
+                return cancelledResponse;
+              }
+              return yield* Fiber.join(promptRpcFiber.value).pipe(
+                Effect.catchCause((cause) =>
+                  Cause.hasInterruptsOnly(cause)
+                    ? Effect.succeed(cancelledResponse)
+                    : Effect.failCause(cause),
+                ),
+                Effect.ensuring(
+                  Effect.gen(function* () {
+                    yield* Fiber.interrupt(promptRpcFiber.value).pipe(Effect.ignore);
+                    yield* Ref.set(activePromptFiberRef, Option.none());
+                  }),
+                ),
+                // Closed however the prompt ends, not only when it succeeds. An
+                // agent that streamed some text and then failed the RPC left its
+                // segment open, and the next prompt closed it on the way in —
+                // after the caller had moved to a new turn, so the `item.completed`
+                // landed on the wrong one. A failed prompt still ends whatever it
+                // was saying.
+                Effect.ensuring(
+                  closeActiveAssistantSegment({
+                    queue: eventQueue,
+                    assistantSegmentRef,
+                  }),
+                ),
+              );
+            }),
+          );
+        }),
       cancel: getStartedState.pipe(
         Effect.flatMap((started) =>
           // Taken under the same gate `prompt` publishes its fiber under, so a
@@ -804,6 +818,7 @@ export const make = (
           dispatchGate.withPermit(
             Effect.uninterruptible(
               Effect.gen(function* () {
+                yield* Ref.update(cancellationGenerationRef, (generation) => generation + 1);
                 // Written before the interrupt. Interrupting first releases the
                 // serialization semaphore at once, and the queued prompt behind
                 // it would reach the agent ahead of this notification and absorb

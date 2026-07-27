@@ -269,6 +269,52 @@ describe("AcpSessionRuntime", () => {
     ),
   );
 
+  it.effect("cancels prompts that were already waiting for prompt serialization", () =>
+    Effect.gen(function* () {
+      const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;
+      yield* runtime.start();
+
+      const firstPrompt = yield* runtime
+        .prompt({
+          prompt: [{ type: "text", text: "hang forever" }],
+        })
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* TestClock.adjust("500 millis");
+      const queuedPrompt = yield* runtime
+        .prompt({
+          prompt: [{ type: "text", text: "already queued" }],
+        })
+        .pipe(Effect.forkChild({ startImmediately: true }));
+
+      yield* runtime.cancel;
+
+      expect(yield* Fiber.join(firstPrompt)).toMatchObject({ stopReason: "cancelled" });
+      expect(yield* Fiber.join(queuedPrompt)).toMatchObject({ stopReason: "cancelled" });
+      expect(
+        yield* runtime.prompt({
+          prompt: [{ type: "text", text: "submitted after cancellation" }],
+        }),
+      ).toMatchObject({ stopReason: "end_turn" });
+    }).pipe(
+      Effect.provide(
+        AcpSessionRuntime.layer({
+          spawn: {
+            command: mockAgentCommand,
+            args: mockAgentArgs,
+            env: {
+              T3_ACP_HANG_FIRST_PROMPT_FOREVER: "1",
+            },
+          },
+          cwd: process.cwd(),
+          clientInfo: { name: "t3-test", version: "0.0.0" },
+          authMethodId: "test",
+        }),
+      ),
+      Effect.scoped,
+      Effect.provide(NodeServices.layer),
+    ),
+  );
+
   it.effect("segments assistant text around ACP tool calls", () =>
     Effect.gen(function* () {
       const runtime = yield* AcpSessionRuntime.AcpSessionRuntime;

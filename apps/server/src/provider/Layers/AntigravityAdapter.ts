@@ -1489,7 +1489,6 @@ export function makeAntigravityAdapter(
           for (const [, approval] of pending) {
             yield* Effect.ignore(Deferred.succeed(approval.decision, "cancel"));
           }
-          pending.clear();
         }
         // The fence names the epoch being cancelled through, rather than one
         // notification per outstanding prompt. Everything accepted at or below

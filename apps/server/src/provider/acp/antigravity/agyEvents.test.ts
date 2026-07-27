@@ -9,6 +9,7 @@ import {
   agyToolTitle,
   hookSessionUpdate,
   makeAgyTurnState,
+  orderAgySessionUpdates,
   type AgyHookEvent,
 } from "./agyEvents.ts";
 
@@ -216,6 +217,31 @@ describe("hookSessionUpdate", () => {
     );
 
     expect(update).not.toHaveProperty("content");
+  });
+});
+
+describe("orderAgySessionUpdates", () => {
+  it("orders hooks and transcript updates by step", () => {
+    const update = (name: string) => ({ name });
+
+    expect(
+      orderAgySessionUpdates([
+        { stepIdx: 3, phase: "pre", update: update("tool 3") },
+        { stepIdx: 2, phase: "transcript", update: update("assistant 2") },
+      ]),
+    ).toEqual([update("assistant 2"), update("tool 3")]);
+  });
+
+  it("announces a call before its output and completes it afterwards", () => {
+    const update = (name: string) => ({ name });
+
+    expect(
+      orderAgySessionUpdates([
+        { stepIdx: 4, phase: "terminal", update: update("complete") },
+        { stepIdx: 4, phase: "pre", update: update("announce") },
+        { stepIdx: 4, phase: "transcript", update: update("output") },
+      ]),
+    ).toEqual([update("announce"), update("output"), update("complete")]);
   });
 });
 

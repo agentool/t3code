@@ -35,9 +35,11 @@ import {
   agyToolTitle,
   hookSessionUpdate,
   makeAgyTurnState,
+  orderAgySessionUpdates,
   type AgyHookDecision,
   type AgyHookEvent,
   type AgyHookPayload,
+  type AgyOrderedSessionUpdate,
   type AgySessionUpdate,
   type AgyTurnState,
 } from "./agyEvents.ts";
@@ -1217,8 +1219,8 @@ let activeTurnToken: TurnToken | undefined;
 /**
  * Drain everything Antigravity has produced so far and emit it as ACP updates.
  *
- * Hooks are read first so a tool call is always announced before the
- * transcript record carrying its output is matched against it.
+ * Hooks are ingested first so transcript records can match tool calls, then
+ * both sources are emitted in Antigravity step order.
  */
 function drain(input: {
   readonly sessionId: string;
@@ -1234,6 +1236,8 @@ function drain(input: {
   /** Defaults to true; set false to run hook and terminal cleanup only. */
   readonly readTranscript?: boolean;
 }): boolean {
+  const bufferedUpdates: Array<AgyOrderedSessionUpdate> = [];
+  const approvals: Array<{ readonly name: string; readonly payload: AgyHookPayload }> = [];
   for (const { name, event: hook } of readHookEvents(input.hookDir, input.seenHooks)) {
     // Diffing the file contents each hook captured, rather than the arguments
     // of the edit, keeps this correct across tools whose argument shapes
@@ -1255,7 +1259,11 @@ function drain(input: {
         // since the transcript is read once by byte offset.
         input.state.pendingTerminal.set(stepIdx, update);
       } else {
-        sendSessionUpdate(input.sessionId, update);
+        bufferedUpdates.push({
+          stepIdx,
+          phase: hook.event === "pre-tool-use" ? "pre" : "terminal",
+          update,
+        });
       }
     }
     // The hook process is blocked until a decision file appears, so this has
@@ -1271,13 +1279,7 @@ function drain(input: {
           reason: "Antigravity turn ended before this tool was approved",
         });
       } else {
-        requestToolApproval({
-          sessionId: input.sessionId,
-          hookDir: input.hookDir,
-          hookName: name,
-          payload: hook.payload,
-          turnToken: input.turnToken,
-        });
+        approvals.push({ name, payload: hook.payload });
       }
     }
   }
@@ -1344,6 +1346,7 @@ function drain(input: {
     if (!input.state.transcriptPrimed && allLines.length > 0) {
       const trimmed = dropPriorTurnRecords(allLines);
       const foundBoundary = trimmed.length !== allLines.length;
+      input.state.transcriptBoundarySeen = input.state.transcriptBoundarySeen || foundBoundary;
       if (input.state.resumedConversation && !input.final && moreTranscript) {
         // Still short of the end of the file, so no `USER_INPUT` seen so far can
         // be trusted to be this turn's: the current turn's opening record may
@@ -1355,12 +1358,13 @@ function drain(input: {
         // what keeps the hold bounded to a single turn's output.
         const heldChars =
           input.cursor.carryLength + trimmed.reduce((total, line) => total + line.length + 1, 0);
-        if (!foundBoundary && heldChars > MAX_TRANSCRIPT_LINE_CHARS) {
+        if (!input.state.transcriptBoundarySeen && heldChars > MAX_TRANSCRIPT_LINE_CHARS) {
           // No boundary anywhere in a budget's worth of scanning. Give up on
-          // locating it and drop what was scanned: this turn loses whatever
-          // preceded this point, which is the right way to be wrong. Priming on
-          // it instead would replay another turn's output as this one's.
-          input.state.transcriptPrimed = true;
+          // what was scanned, including the partial record at the read cutoff:
+          // this turn loses whatever preceded this point, which is the right
+          // way to be wrong. Priming while unread bytes remain would replay
+          // another turn's output as this one's.
+          input.cursor.discardThroughNextNewline();
         } else {
           input.cursor.retain(trimmed);
         }
@@ -1434,14 +1438,25 @@ function drain(input: {
             continue;
           }
           for (const update of retried.updates) {
-            sendSessionUpdate(input.sessionId, update);
+            bufferedUpdates.push({
+              stepIdx: candidate.step_index,
+              phase: "transcript",
+              update,
+            });
           }
           if (retried.emittedAssistantText) {
             input.assistantText.emitted = true;
           }
           const retriedStep = candidate.step_index;
           if (typeof retriedStep === "number") {
-            flushTerminal(input.sessionId, input.state, retriedStep);
+            const terminal = takeTerminal(input.state, retriedStep);
+            if (terminal) {
+              bufferedUpdates.push({
+                stepIdx: retriedStep,
+                phase: "terminal",
+                update: terminal,
+              });
+            }
           }
         }
         if (trimmed) {
@@ -1453,7 +1468,11 @@ function drain(input: {
         break;
       }
       for (const update of result.updates) {
-        sendSessionUpdate(input.sessionId, update);
+        bufferedUpdates.push({
+          stepIdx: record.step_index,
+          phase: "transcript",
+          update,
+        });
       }
       if (result.emittedAssistantText) {
         input.assistantText.emitted = true;
@@ -1461,7 +1480,14 @@ function drain(input: {
       // This step's output is out; the call can be completed now.
       const stepIndex = record.step_index;
       if (typeof stepIndex === "number") {
-        flushTerminal(input.sessionId, input.state, stepIndex);
+        const terminal = takeTerminal(input.state, stepIndex);
+        if (terminal) {
+          bufferedUpdates.push({
+            stepIdx: stepIndex,
+            phase: "terminal",
+            update: terminal,
+          });
+        }
       }
     }
   }
@@ -1469,23 +1495,36 @@ function drain(input: {
   // Nothing more will arrive, so anything still waiting on a transcript record
   // that never came is completed without output rather than left spinning.
   if (input.final) {
-    const remaining = [...input.state.pendingTerminal.values()];
+    const remaining = [...input.state.pendingTerminal];
     input.state.pendingTerminal.clear();
-    for (const terminal of remaining) {
-      sendSessionUpdate(input.sessionId, terminal);
+    for (const [stepIdx, terminal] of remaining) {
+      bufferedUpdates.push({ stepIdx, phase: "terminal", update: terminal });
     }
+  }
+
+  for (const update of orderAgySessionUpdates(bufferedUpdates)) {
+    sendSessionUpdate(input.sessionId, update);
+  }
+  for (const approval of approvals) {
+    requestToolApproval({
+      sessionId: input.sessionId,
+      hookDir: input.hookDir,
+      hookName: approval.name,
+      payload: approval.payload,
+      turnToken: input.turnToken,
+    });
   }
 
   return moreTranscript;
 }
 
-function flushTerminal(sessionId: string, state: AgyTurnState, stepIdx: number): void {
+function takeTerminal(state: AgyTurnState, stepIdx: number): AgySessionUpdate | undefined {
   const terminal = state.pendingTerminal.get(stepIdx);
   if (!terminal) {
-    return;
+    return undefined;
   }
   state.pendingTerminal.delete(stepIdx);
-  sendSessionUpdate(sessionId, terminal);
+  return terminal;
 }
 
 /**
@@ -1688,9 +1727,23 @@ async function runTurn(
     });
   }, HOOK_POLL_INTERVAL_MS);
 
+  let childError: Error | undefined;
   const exitCode = await new Promise<number | null>((resolve) => {
-    child.on("error", () => resolve(null));
-    child.on("close", (code) => resolve(code));
+    child.on("error", (error) => {
+      childError = error;
+      // An error can report a failed kill while the process is still alive.
+      // The turn continues to own and poll the child until `close`; arm the
+      // normal escalation rather than releasing its directories underneath it.
+      if (
+        activeChild === child &&
+        child.pid !== undefined &&
+        child.exitCode === null &&
+        child.signalCode === null
+      ) {
+        killActiveChild();
+      }
+    });
+    child.once("close", (code) => resolve(code));
   });
 
   clearInterval(poller);
@@ -1813,8 +1866,10 @@ async function runTurn(
   if (cancelled) {
     return { stopReason: "cancelled" };
   }
-  if (exitCode !== 0) {
-    const captured = stderr.trim() || stdout.trim();
+  if (exitCode !== 0 || childError !== undefined) {
+    const processError = childError?.message.trim() ?? "";
+    const processOutput = stderr.trim() || stdout.trim();
+    const captured = [processError, processOutput].filter((part) => part.length > 0).join("\n");
     const truncated = stderr.trim() ? stderrTruncated : stdoutTruncated;
     const detail = captured
       ? truncated

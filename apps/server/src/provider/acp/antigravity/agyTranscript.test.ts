@@ -307,4 +307,23 @@ describe("AgyTranscriptCursor", () => {
 
     expect(cursor.bytesConsumed).toBe(Buffer.byteLength(huge, "utf8"));
   });
+
+  it("discards a scanned partial record through its next newline", () => {
+    const cursor = new AgyTranscriptCursor();
+    cursor.push('{"historical":"partial');
+
+    cursor.discardThroughNextNewline();
+
+    expect(cursor.carryLength).toBe(0);
+    expect(cursor.push(' record"}\n{"current":true}\n')).toEqual(['{"current":true}']);
+  });
+
+  it("discards retained history when abandoning a scan", () => {
+    const cursor = new AgyTranscriptCursor();
+    cursor.retain(['{"historical":true}']);
+
+    cursor.discardThroughNextNewline();
+
+    expect(cursor.push('{"current":true}\n')).toEqual(['{"current":true}']);
+  });
 });

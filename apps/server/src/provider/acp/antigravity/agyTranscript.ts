@@ -290,6 +290,20 @@ export class AgyTranscriptCursor {
     }
   }
 
+  /**
+   * Abandon everything scanned so far and resume after the current record.
+   *
+   * A capped read can stop inside a record. Clearing only the completed lines
+   * leaves that fragment in `carry`, where the next read can complete and emit
+   * a historical record as though it belonged to the current turn.
+   */
+  discardThroughNextNewline(): void {
+    const endedInsideRecord = this.carry.length > 0 || this.discarding;
+    this.carry = "";
+    this.retained = [];
+    this.discarding = endedInsideRecord;
+  }
+
   /** Flush the trailing line once the writer is known to be finished. */
   flush(): ReadonlyArray<string> {
     const remaining = this.carry;

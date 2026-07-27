@@ -245,6 +245,12 @@ export interface AgyTurnState {
    */
   transcriptPrimed: boolean;
   /**
+   * Whether priming has crossed a `USER_INPUT` record. The marker itself is
+   * removed from the retained suffix, so later capped reads cannot rediscover
+   * it and must remember that the suffix already follows a boundary.
+   */
+  transcriptBoundarySeen: boolean;
+  /**
    * Whether this turn resumed an existing conversation. Only then can the
    * transcript already hold other turns' records at byte 0.
    */
@@ -263,6 +269,7 @@ export function makeAgyTurnState(conversationId?: string): AgyTurnState {
     transcriptPath: undefined,
     resolvedTranscriptPath: undefined,
     transcriptPrimed: false,
+    transcriptBoundarySeen: false,
     resumedConversation: conversationId !== undefined,
     modelName: undefined,
   };
@@ -277,6 +284,32 @@ export interface AgyTranscriptRecordLike {
 
 /** A `session/update` payload, shaped for ACP but kept as plain JSON. */
 export type AgySessionUpdate = Record<string, unknown>;
+
+export interface AgyOrderedSessionUpdate {
+  readonly stepIdx: number | undefined;
+  readonly phase: "pre" | "transcript" | "terminal";
+  readonly update: AgySessionUpdate;
+}
+
+/**
+ * Order updates reconstructed from independent hook and transcript sources.
+ *
+ * Step index preserves the order Antigravity executed them in. Within one
+ * step, the call must exist before output is attached and must stay open until
+ * that output has been sent.
+ */
+export function orderAgySessionUpdates(
+  entries: ReadonlyArray<AgyOrderedSessionUpdate>,
+): ReadonlyArray<AgySessionUpdate> {
+  const phaseOrder = { pre: 0, transcript: 1, terminal: 2 } as const;
+  return [...entries]
+    .sort((left, right) => {
+      const leftStep = left.stepIdx ?? Number.POSITIVE_INFINITY;
+      const rightStep = right.stepIdx ?? Number.POSITIVE_INFINITY;
+      return leftStep - rightStep || phaseOrder[left.phase] - phaseOrder[right.phase];
+    })
+    .map((entry) => entry.update);
+}
 
 /**
  * Translate one `PreToolUse` hook into an ACP `tool_call` announcement.
