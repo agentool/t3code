@@ -72,6 +72,15 @@ export interface AgyHookEvent {
    * place that observes the true pre-edit state.
    */
   readonly capturedFileText?: string | null;
+  /**
+   * The hook's own stdin, verbatim.
+   *
+   * Written by the hook and hashed by both sides, so an approval is bound to
+   * the exact request the user saw: a payload swapped on disk between the hook
+   * writing it and the bridge reading it produces a different digest, and the
+   * decision is rejected.
+   */
+  readonly rawPayload?: string;
 }
 
 /**

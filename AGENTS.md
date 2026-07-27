@@ -45,6 +45,17 @@ Known constraints, all inherent to print mode:
   answers — a `deny` decision genuinely stops it and is reported back to the model. Controlled
   by the `requireToolApproval` setting, on by default; it fails closed on timeout, a lost
   bridge, or any hook failure. Turn it off to let tools run unattended.
+- **What the approval gate does and does not defend against.** Decisions travel as files in a
+  per-turn temp directory, signed with an HMAC over the hook, the verdict, and a digest of the
+  hook's own payload; the key is generated per turn and reaches the hook through the
+  environment `agy` passes down. That stops an unrelated process forging a decision, stops a
+  decision being replayed onto a different request, and stops a tool approved in one turn
+  signing for any later turn.
+  It does **not** contain a tool within the turn that approved it: that tool inherits the same
+  environment, so it can sign decisions for other tools in that turn. Closing that needs an
+  OS-level boundary — a broker socket or sandbox whose credentials are not inheritable — which
+  is outside what this provider can do while `agy` runs unsandboxed. The gate's purpose is to
+  stop the model acting unilaterally, not to contain code the user has already approved.
 - Attachments are passed by path, not inline: the adapter sends `resource_link` blocks for
   files the attachment store already wrote to disk, and the bridge names those paths in the
   prompt and adds their directory to the workspace. `agy` has no attachment flag, so inline

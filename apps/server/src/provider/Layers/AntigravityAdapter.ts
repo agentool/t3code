@@ -462,14 +462,21 @@ export function makeAntigravityAdapter(
         yield* cleanupContext(ctx);
 
         for (const orphanedTurnId of orphanedTurnIds) {
+          // The stamp is generated inside the ignored region, not before it.
+          // `makeEventStamp` can fail — it mints a UUID — and evaluating it
+          // outside would abort teardown after `ctx.stopped` was set and the
+          // published set cleared, losing this completion and everything after
+          // it with no later stop able to retry.
           yield* Effect.ignore(
-            offerRuntimeEvent({
-              type: "turn.completed",
-              ...(yield* makeEventStamp()),
-              provider: PROVIDER,
-              threadId: ctx.threadId,
-              turnId: orphanedTurnId,
-              payload: { state: "cancelled", stopReason: null },
+            Effect.gen(function* () {
+              yield* offerRuntimeEvent({
+                type: "turn.completed",
+                ...(yield* makeEventStamp()),
+                provider: PROVIDER,
+                threadId: ctx.threadId,
+                turnId: orphanedTurnId,
+                payload: { state: "cancelled", stopReason: null },
+              });
             }),
           );
         }
@@ -478,12 +485,14 @@ export function makeAntigravityAdapter(
         // session exiting.
         if (sessions.get(ctx.threadId) === undefined) {
           yield* Effect.ignore(
-            offerRuntimeEvent({
-              type: "session.exited",
-              ...(yield* makeEventStamp()),
-              provider: PROVIDER,
-              threadId: ctx.threadId,
-              payload: { exitKind: "graceful" },
+            Effect.gen(function* () {
+              yield* offerRuntimeEvent({
+                type: "session.exited",
+                ...(yield* makeEventStamp()),
+                provider: PROVIDER,
+                threadId: ctx.threadId,
+                payload: { exitKind: "graceful" },
+              });
             }),
           );
         }
@@ -592,8 +601,11 @@ export function makeAntigravityAdapter(
           // no session context for teardown to clean up, and repeated failures
           // across thread ids would grow the map. Registered after `start()`.
           const pendingApprovals = new Map<ApprovalRequestId, PendingApproval>();
-          yield* acp.handleRequestPermission((params) =>
-            mapAcpCallbackFailure(
+          yield* acp.handleRequestPermission((params) => {
+            // Held outside the workflow so the finalizer can clear the entry
+            // wherever inside it things stopped.
+            let registeredRequestId: ApprovalRequestId | undefined;
+            return mapAcpCallbackFailure(
               Effect.gen(function* () {
                 // Bound to the turn actually running, with the epoch that turn
                 // was accepted at — not the session's current epoch. A request
@@ -620,6 +632,7 @@ export function makeAntigravityAdapter(
                 const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
                 const decision = yield* Deferred.make<ProviderApprovalDecision>();
                 pendingApprovals.set(requestId, { decision });
+                registeredRequestId = requestId;
                 // Rechecked after registering, not only before: minting the id
                 // and the deferred both yield, and a Stop landing in that gap
                 // would find no entry to cancel — leaving this request open in
@@ -653,7 +666,6 @@ export function makeAntigravityAdapter(
                 // this the handler would stay blocked and the entry retained.
                 const answered = yield* Deferred.await(decision).pipe(
                   Effect.timeoutOption(APPROVAL_WAIT_MS),
-                  Effect.ensuring(Effect.sync(() => pendingApprovals.delete(requestId))),
                 );
                 // An unanswered request denies, matching the bridge's own
                 // timeout: this gate must never resolve to "allow" by default.
@@ -685,9 +697,21 @@ export function makeAntigravityAdapter(
                     ? { outcome: "selected" as const, optionId }
                     : ({ outcome: "cancelled" } as const),
                 };
-              }),
-            ),
-          );
+              }).pipe(
+                // Covers everything after the entry was registered, not just
+                // the wait: a failure while stamping or publishing either event
+                // would otherwise leave the entry in the map for good, and the
+                // request open in the UI with nothing able to answer it.
+                Effect.ensuring(
+                  Effect.sync(() => {
+                    if (registeredRequestId !== undefined) {
+                      pendingApprovals.delete(registeredRequestId);
+                    }
+                  }),
+                ),
+              ),
+            );
+          });
 
           const started = yield* acp
             .start()

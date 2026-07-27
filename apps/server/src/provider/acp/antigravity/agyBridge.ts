@@ -14,6 +14,8 @@
  */
 // @effect-diagnostics nodeBuiltinImport:off - Standalone stdio bridge process, not an Effect runtime.
 // @effect-diagnostics globalTimers:off - Polls Antigravity hook output outside any Effect runtime.
+/* eslint-disable t3code/no-global-process-runtime -- Standalone process: there
+   is no Effect runtime here to inject HostProcessPlatform from. */
 import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
@@ -372,6 +374,10 @@ function readHookEvents(hookDir: string, seen: Set<string>): ReadonlyArray<Obser
       const raw = NodeFS.readFileSync(NodePath.join(hookDir, name), "utf8");
       const parsed: unknown = JSON.parse(raw);
       if (typeof parsed === "object" && parsed !== null) {
+        // Digested from the bytes on disk, which is what the hook itself
+        // hashed; a file swapped in between changes this and the hook rejects
+        // the decision rather than acting on a request nobody approved.
+        hookPayloadDigests.set(name, digestPayload((parsed as AgyHookEvent).rawPayload ?? ""));
         events.push({ name, event: parsed as AgyHookEvent });
       }
     } catch {
@@ -429,15 +435,30 @@ function decisionPath(hookDir: string, hookName: string): string {
  * generated per bridge process and reaches the hook through its environment,
  * so a forged file fails the check and is treated as no decision at all.
  */
-function signDecision(hookName: string, decision: AgyHookDecision): string {
-  // Both sides resolve the same value: the bridge holds it in memory, and the
-  // hook — a separate process — reads the copy handed to it in its
-  // environment.
-  const secret = process.env[HOOK_SECRET_ENV] || hookSecret;
+function signDecision(
+  secret: string,
+  hookName: string,
+  decision: AgyHookDecision,
+  payloadDigest: string,
+): string {
+  // The payload digest is part of what is signed, so a decision cannot be
+  // lifted onto a different request. Without it, a watcher could swap a
+  // dangerous hook payload for a harmless one, let the user approve what they
+  // were shown, and have the signed answer authorise the original.
   return NodeCrypto.createHmac("sha256", secret)
-    .update(`${hookName}:${decision.decision}`)
+    .update(`${hookName}:${decision.decision}:${payloadDigest}`)
     .digest("hex");
 }
+
+function digestPayload(raw: string): string {
+  return NodeCrypto.createHash("sha256").update(raw).digest("hex");
+}
+
+/**
+ * Digest of each observed hook's raw payload, so a decision can be bound to the
+ * exact request the user was shown.
+ */
+const hookPayloadDigests = new Map<string, string>();
 
 function writeDecision(hookDir: string, hookName: string, decision: AgyHookDecision): void {
   try {
@@ -445,7 +466,15 @@ function writeDecision(hookDir: string, hookName: string, decision: AgyHookDecis
     const staging = `${target}.tmp`;
     NodeFS.writeFileSync(
       staging,
-      JSON.stringify({ ...decision, mac: signDecision(hookName, decision) }),
+      JSON.stringify({
+        ...decision,
+        mac: signDecision(
+          turnHookSecret,
+          hookName,
+          decision,
+          hookPayloadDigests.get(hookName) ?? "",
+        ),
+      }),
     );
     NodeFS.renameSync(staging, target);
   } catch {
@@ -583,6 +612,7 @@ export async function runAgyHook(event: string): Promise<void> {
       const record: AgyHookEvent = {
         event,
         payload,
+        rawPayload: raw,
         // Snapshot the file here, while the hook still brackets the tool call.
         ...(agyToolKind(payload?.toolCall?.name) === "edit"
           ? { capturedFileText: captureFileText(agyTargetPath(payload?.toolCall)) }
@@ -603,7 +633,7 @@ export async function runAgyHook(event: string): Promise<void> {
         // fall through to the observation-only response, which allows — so a
         // change in Antigravity's payload shape would have run tools unapproved.
         const decision = payload?.toolCall
-          ? await awaitDecision(hookDir, name)
+          ? await awaitDecision(hookDir, name, digestPayload(raw))
           : ({
               decision: "deny",
               reason: "T3 Code could not identify this tool call for approval",
@@ -635,7 +665,11 @@ export async function runAgyHook(event: string): Promise<void> {
  * Fails closed: if the bridge dies, the client never answers, or the deadline
  * passes, the tool is denied rather than quietly allowed.
  */
-async function awaitDecision(hookDir: string, hookName: string): Promise<AgyHookDecision> {
+async function awaitDecision(
+  hookDir: string,
+  hookName: string,
+  payloadDigest: string,
+): Promise<AgyHookDecision> {
   const target = decisionPath(hookDir, hookName);
   const deadline = Date.now() + APPROVAL_WAIT_MS;
   while (Date.now() < deadline) {
@@ -644,7 +678,12 @@ async function awaitDecision(hookDir: string, hookName: string): Promise<AgyHook
       const parsed: unknown = JSON.parse(raw);
       if (isRecord(parsed) && (parsed["decision"] === "allow" || parsed["decision"] === "deny")) {
         const decision = { decision: parsed["decision"] } as AgyHookDecision;
-        const expected = signDecision(hookName, decision);
+        const expected = signDecision(
+          process.env[HOOK_SECRET_ENV] ?? "",
+          hookName,
+          decision,
+          payloadDigest,
+        );
         const presented = typeof parsed["mac"] === "string" ? parsed["mac"] : "";
         // Length-checked before comparing: `timingSafeEqual` throws on a
         // mismatch, and an unsigned file is a forgery either way.
@@ -867,10 +906,14 @@ interface TurnOutcome {
 }
 
 /**
- * Per-process secret authenticating approval decisions. Reaches hook processes
- * through their environment and never touches disk.
+ * Secret authenticating this turn's approval decisions.
+ *
+ * Rotated per turn, not per process. The secret has to reach the hook, the hook
+ * is spawned by `agy`, and every tool `agy` runs inherits that environment — so
+ * an approved tool can always forge decisions for the turn it is part of.
+ * Rotating means it cannot forge for any later turn.
  */
-const hookSecret = NodeCrypto.randomBytes(32).toString("hex");
+let turnHookSecret = "";
 
 let activeChild: NodeChildProcess.ChildProcess | null = null;
 
@@ -887,6 +930,21 @@ function killActiveChild(): void {
     return;
   }
   const { pid } = child;
+  if (process.platform === "win32") {
+    // Windows has no process groups to signal; this walks the tree instead.
+    try {
+      NodeChildProcess.execFileSync("taskkill", ["/pid", String(pid), "/T", "/F"], {
+        stdio: "ignore",
+      });
+    } catch {
+      try {
+        child.kill();
+      } catch {
+        // Nothing left to kill.
+      }
+    }
+    return;
+  }
   const signalGroup = (signal: NodeJS.Signals) => {
     try {
       // Negative pid targets the group, which `detached: true` gave the child.
@@ -901,10 +959,12 @@ function killActiveChild(): void {
     }
   };
   signalGroup("SIGTERM");
+  // Escalation does not depend on the leader still being alive. `agy` can exit
+  // on SIGTERM while a tool it started ignores the signal and keeps the group —
+  // and the workspace — busy; signalling a group that has genuinely gone is
+  // harmless, the error is caught above.
   const escalation = setTimeout(() => {
-    if (activeChild === child && child.exitCode === null && child.signalCode === null) {
-      signalGroup("SIGKILL");
-    }
+    signalGroup("SIGKILL");
   }, KILL_ESCALATION_MS);
   escalation.unref?.();
 }
@@ -1179,6 +1239,10 @@ async function runTurn(
   // holding this claim. Leaving it unset until after the spawn would silently
   // drop those, letting an auto-approving child run on past a cancelled turn.
   activeTurnSessionId = sessionId;
+  // Rotated before the spawn, so the child is handed this turn's secret: a tool
+  // approved in an earlier turn holds that turn's, and cannot sign anything
+  // this one will accept.
+  turnHookSecret = NodeCrypto.randomBytes(32).toString("hex");
   // Measured before `agy` starts: whatever the transcript already holds
   // belongs to earlier turns of the conversation being resumed.
   const baseline = transcriptBaseline(session.conversationId);
@@ -1202,7 +1266,7 @@ async function runTurn(
       }),
       {
         cwd: session.cwd,
-        env: { ...process.env, [HOOK_DIR_ENV]: hookDir, [HOOK_SECRET_ENV]: hookSecret },
+        env: { ...process.env, [HOOK_DIR_ENV]: hookDir, [HOOK_SECRET_ENV]: turnHookSecret },
         stdio: ["ignore", "pipe", "pipe"],
         // Its own process group, so cancelling can reach the tools `agy`
         // spawned rather than only `agy` itself. A tool left running keeps
@@ -1542,6 +1606,24 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
 
 /** Entry point for `t3 agy-acp`. */
 export async function runAgyBridge(): Promise<void> {
+  // `detached: true` means the child outlives this process unless it is told
+  // otherwise. Losing the bridge — a signal, a crashing parent — would
+  // otherwise leave `agy` and its tools running against the user's workspace
+  // with nothing left to stop them.
+  const stopChildOnExit = () => {
+    shuttingDown = true;
+    killActiveChild();
+  };
+  process.once("SIGTERM", () => {
+    stopChildOnExit();
+    process.exit(0);
+  });
+  process.once("SIGINT", () => {
+    stopChildOnExit();
+    process.exit(0);
+  });
+  process.once("exit", stopChildOnExit);
+
   let buffer = "";
   // Requests are handled strictly in order: a turn holds the agent busy, and
   // ACP clients do not pipeline prompts for one session.
