@@ -181,8 +181,15 @@ export interface AgyToolCallRecord {
   readonly name: string | undefined;
   readonly kind: AcpToolKind;
   readonly targetPath: string | undefined;
-  /** File contents captured at `PreToolUse`, used to build an edit diff. */
-  readonly beforeText: string | undefined;
+  /**
+   * File contents captured at `PreToolUse`, used to build an edit diff.
+   *
+   * Released as soon as that diff has been built. Records are kept for the
+   * whole turn so late transcript output can still attach to them, and holding
+   * every edited file's prior contents for that long is what turns a long edit
+   * loop into gigabytes of heap.
+   */
+  beforeText: string | undefined;
   /** Set by `PostToolUse`. Records are kept after completion so a transcript
    * record that lands in the same poll can still attach the tool's output. */
   completed: boolean;
@@ -362,6 +369,10 @@ export function postToolUseUpdate(
       newText: afterText,
     });
   }
+  // The diff is built, so the captured contents have no further use. This is
+  // the only thing held here that scales with file size rather than with the
+  // number of steps.
+  active.beforeText = undefined;
 
   return {
     sessionUpdate: "tool_call_update",

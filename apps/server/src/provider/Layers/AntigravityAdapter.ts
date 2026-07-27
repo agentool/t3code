@@ -98,6 +98,13 @@ const APPROVAL_WAIT_MS = 9 * 60 * 1000;
  * path settles well inside it.
  */
 const CANCEL_ACK_TIMEOUT_MS = 10_000;
+/**
+ * How long turn settlement waits for an approval handler it just cancelled to
+ * publish its resolution. Short: the handler is already unblocked, so this only
+ * covers the hop back through the runtime, and a turn must never be held open
+ * by a handler that will not finish.
+ */
+const APPROVAL_SETTLE_TIMEOUT_MS = 5_000;
 const ANTIGRAVITY_RESUME_VERSION = 1 as const;
 
 export interface AntigravityAdapterLiveOptions {
@@ -240,6 +247,14 @@ interface ThreadLock {
 
 interface PendingApproval {
   readonly decision: Deferred.Deferred<ProviderApprovalDecision>;
+  /**
+   * The turn this request belongs to, so settlement can release exactly the
+   * approvals its own turn opened. Undefined when no turn was active, which
+   * only happens for a request arriving outside a prompt.
+   */
+  readonly turnId: TurnId | undefined;
+  /** Completed once the handler has published this request's resolution. */
+  readonly settled: Deferred.Deferred<void>;
 }
 
 function selectPermissionOptionId(
@@ -694,7 +709,8 @@ export function makeAntigravityAdapter(
                 const permissionRequest = parsePermissionRequest(params);
                 const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
                 const decision = yield* Deferred.make<ProviderApprovalDecision>();
-                pendingApprovals.set(requestId, { decision });
+                const settled = yield* Deferred.make<void>();
+                pendingApprovals.set(requestId, { decision, turnId: approvalTurnId, settled });
                 registeredRequestId = requestId;
                 // Rechecked after registering, not only before: minting the id
                 // and the deferred both yield, and a Stop landing in that gap
@@ -742,6 +758,29 @@ export function makeAntigravityAdapter(
                 const resolved: ProviderApprovalDecision = Option.isSome(answered)
                   ? answered.value
                   : "cancel";
+                // Re-checked at the moment of answering: an approval decided
+                // while Stop was landing must not come back as an allow.
+                //
+                // Turn identity is part of that check, not just the epoch. Two
+                // consecutive turns with no cancel between them share an epoch,
+                // so a request still open when its own turn ended would look
+                // current again once the next one started, and this would
+                // answer "allow" for a tool whose token the bridge has already
+                // retired.
+                const stillLive =
+                  !ctx?.stopped &&
+                  ctx?.activeTurnId === approvalTurnId &&
+                  (approvalEpoch === undefined || ctx?.cancelEpoch === approvalEpoch);
+                const optionId =
+                  resolved === "cancel" || !stillLive
+                    ? undefined
+                    : selectPermissionOptionId(params, resolved);
+                // Decided before the event is built, so what the UI is told and
+                // what the agent is told are the same thing. Publishing the
+                // user's raw answer here reported an approval that the liveness
+                // check had already turned into a cancellation — the tool did
+                // not run, and the transcript claimed it was allowed to.
+                const effective: ProviderApprovalDecision = optionId ? resolved : "cancel";
                 // Same pairing on the way out: an interrupt between publishing
                 // this and recording it would have the finalizer publish a
                 // second, contradictory resolution.
@@ -752,7 +791,7 @@ export function makeAntigravityAdapter(
                   turnId: approvalTurnId,
                   requestId: RuntimeRequestId.make(requestId),
                   permissionRequest,
-                  decision: resolved,
+                  decision: effective,
                 });
                 yield* Effect.uninterruptible(
                   Effect.gen(function* () {
@@ -760,24 +799,6 @@ export function makeAntigravityAdapter(
                     resolutionPublished = true;
                   }),
                 );
-                // Re-checked at the moment of answering: an approval decided
-                // while Stop was landing must not come back as an allow.
-                //
-                // Turn identity is part of that check, not just the epoch. Two
-                // consecutive turns with no cancel between them share an epoch,
-                // so a request still open when its own turn ended would look
-                // current again once the next one started, and this would
-                // answer "allow" for a tool whose token the bridge has already
-                // retired. The bridge denies it either way — the damage is a UI
-                // reporting an approval that was never honoured.
-                const stillLive =
-                  !ctx?.stopped &&
-                  ctx?.activeTurnId === approvalTurnId &&
-                  (approvalEpoch === undefined || ctx?.cancelEpoch === approvalEpoch);
-                const optionId =
-                  resolved === "cancel" || !stillLive
-                    ? undefined
-                    : selectPermissionOptionId(params, resolved);
                 return {
                   outcome: optionId
                     ? { outcome: "selected" as const, optionId }
@@ -813,7 +834,15 @@ export function makeAntigravityAdapter(
                         );
                       }
                       if (registeredRequestId !== undefined) {
+                        const registered = pendingApprovals.get(registeredRequestId);
                         pendingApprovals.delete(registeredRequestId);
+                        // Announces that this handler is done publishing. Turn
+                        // settlement cancels outstanding approvals and waits on
+                        // this, so `request.resolved` precedes `turn.completed`
+                        // instead of racing it.
+                        if (registered !== undefined) {
+                          yield* Effect.ignore(Deferred.succeed(registered.settled, undefined));
+                        }
                       }
                     }),
                   ),
@@ -1316,6 +1345,31 @@ export function makeAntigravityAdapter(
                 ctx.lifecycleGate
                   .withPermit(
                     Effect.gen(function* () {
+                      // Anything this turn opened and never got an answer for is
+                      // released here. `agy` dying with a hook mid-approval used
+                      // to leave the request sitting in the UI for the full nine
+                      // minute deadline, unanswerable, with the turn already
+                      // reported complete.
+                      //
+                      // Done before `activeTurnId` is cleared so the handlers see
+                      // the state they were opened against, and awaited — with a
+                      // bound, because a handler that never finishes must not
+                      // strand the turn — so `request.resolved` is published
+                      // before the completion below.
+                      const orphanedApprovals = [...ctx.approvals.entries()].filter(
+                        ([, approval]) => approval.turnId === turnId,
+                      );
+                      for (const [requestId, approval] of orphanedApprovals) {
+                        yield* Effect.ignore(Deferred.succeed(approval.decision, "cancel"));
+                        ctx.approvals.delete(requestId);
+                      }
+                      for (const [, approval] of orphanedApprovals) {
+                        yield* Effect.ignore(
+                          Deferred.await(approval.settled).pipe(
+                            Effect.timeoutOption(APPROVAL_SETTLE_TIMEOUT_MS),
+                          ),
+                        );
+                      }
                       // One prompt per turn, so this settles unconditionally.
                       // Cleared even when the turn never started — a model switch can
                       // fail after `activeTurnId` is installed, and leaving it set

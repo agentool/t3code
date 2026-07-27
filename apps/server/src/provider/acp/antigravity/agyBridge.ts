@@ -72,6 +72,17 @@ const HOOK_POLL_INTERVAL_MS = 50;
  * short enough that a step no hook will ever cover does not stall the stream.
  */
 const MAX_DEFERRED_DRAINS = 20;
+
+/**
+ * Aggregate ceiling on records held waiting for a tool call to be announced.
+ *
+ * `MAX_DEFERRED_DRAINS` expires the head of the queue, which is enough when
+ * unmatched records are occasional. It is not enough when they arrive faster
+ * than one per drain, which is what a transcript full of internal planner steps
+ * looks like — hence a cap on the queue as a whole.
+ */
+const MAX_DEFERRED_RECORDS = 512;
+const MAX_DEFERRED_CHARS = 8 * 1024 * 1024;
 /**
  * Cap on the `agy` output held in memory per stream. Only the tail is kept:
  * stdout is a fallback used when the transcript streamed nothing, and stderr
@@ -1329,16 +1340,20 @@ function drain(input: {
     // conversation carries every prior turn. Trim once, then stream.
     if (!input.state.transcriptPrimed && allLines.length > 0) {
       const trimmed = dropPriorTurnRecords(allLines);
+      // Measured over the batch itself, not just the cursor's carry: `retain`
+      // puts whole lines back, and the next `push` hands them straight back
+      // here as complete lines. Carry stays small the whole time while the
+      // retained batch grows without limit, so budgeting on carry alone was no
+      // budget at all. Past the limit the batch is accepted as-is — replaying
+      // some earlier output is a worse transcript, but an unbounded hold is a
+      // worse process.
+      const heldChars =
+        input.cursor.carryLength + allLines.reduce((total, line) => total + line.length + 1, 0);
       if (
         trimmed.length === allLines.length &&
         input.state.resumedConversation &&
         !input.final &&
-        // Held content is re-examined against every later read, so a
-        // conversation whose opening record never appears would accumulate the
-        // whole transcript in the cursor. Past the budget the batch is accepted
-        // as-is: replaying some earlier output is a worse transcript, but an
-        // unbounded hold is a worse process.
-        input.cursor.carryLength <= MAX_TRANSCRIPT_LINE_CHARS
+        heldChars <= MAX_TRANSCRIPT_LINE_CHARS
       ) {
         // Resuming, and this batch holds no `USER_INPUT` — so the current
         // turn's opening record has not been written yet and everything here
@@ -1392,6 +1407,19 @@ function drain(input: {
       } else {
         held.push(...records.slice(index).filter((entry) => entry !== undefined));
         input.state.deferredDrains += 1;
+        // Aged out one at a time, but refilled by every poll. Antigravity emits
+        // internal steps far faster than one record per drain interval, so on a
+        // transcript with unhookable steps the queue grows no matter how
+        // patiently the head expires. Trimmed from the front: the oldest held
+        // records are the ones whose hook is least likely to ever arrive.
+        let heldChars = held.reduce((total, entry) => total + (entry.content?.length ?? 0), 0);
+        while (held.length > MAX_DEFERRED_RECORDS || heldChars > MAX_DEFERRED_CHARS) {
+          const dropped = held.shift();
+          if (dropped === undefined) {
+            break;
+          }
+          heldChars -= dropped.content?.length ?? 0;
+        }
         break;
       }
       for (const update of result.updates) {
@@ -1643,8 +1671,9 @@ async function runTurn(
   // cursor while bytes remain would emit a half-written record as if it were
   // whole, and leave the rest of that line to be read as a fragment.
   let finalPasses = 0;
-  while (
-    drain({
+  let transcriptRemains = true;
+  while (transcriptRemains && finalPasses < MAX_FINAL_DRAIN_PASSES) {
+    transcriptRemains = drain({
       sessionId,
       hookDir,
       seenHooks,
@@ -1655,10 +1684,22 @@ async function runTurn(
       assistantText,
       turnToken,
       final: false,
-    }) &&
-    finalPasses < MAX_FINAL_DRAIN_PASSES
-  ) {
+    });
     finalPasses += 1;
+  }
+  if (transcriptRemains) {
+    // The budget ran out with bytes still unread. Flushing the cursor now would
+    // present a half-written line as a whole record and then abandon the rest
+    // in silence, so the partial line is dropped and the shortfall is said out
+    // loud instead.
+    cursor.flush();
+    sendSessionUpdate(sessionId, {
+      sessionUpdate: "agent_message_chunk",
+      content: {
+        type: "text",
+        text: "[Transcript truncated: Antigravity produced more output than this turn could read.]",
+      },
+    });
   }
   drain({
     sessionId,

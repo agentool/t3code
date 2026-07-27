@@ -49,6 +49,12 @@ export type AcpSessionRuntimeEvent = AcpParsedSessionEvent | AcpSessionEventStre
 
 const defaultSessionLoadTimeout = Duration.seconds(90);
 const defaultSessionLoadReplayIdleGap = Duration.seconds(2);
+/**
+ * How long a prompt waits for an in-flight `session/cancel` notification to
+ * reach the agent before sending anyway. Only a backstop against a wedged
+ * transport — the write is a single stdio frame and normally completes at once.
+ */
+const CANCEL_NOTIFICATION_WRITE_TIMEOUT_MS = 5_000;
 
 export interface AcpSpawnInput {
   readonly command: string;
@@ -290,6 +296,18 @@ export const make = (
       ),
     );
     const assistantSegmentRef = yield* Ref.make<AcpAssistantSegmentState>({ nextSegmentIndex: 0 });
+    /**
+     * Set while a `session/cancel` notification is still being written.
+     *
+     * Cancelling interrupts the in-flight prompt, which releases the
+     * serialization semaphore immediately, while the notification itself is
+     * sent on a forked fiber. Without this gate the next queued prompt could
+     * reach the agent first and then be cancelled by a notification meant for
+     * the turn before it.
+     */
+    const cancelNotificationRef = yield* Ref.make<Option.Option<Deferred.Deferred<void>>>(
+      Option.none(),
+    );
     const configOptionsRef = yield* Ref.make(sessionConfigOptionsFromSetup(undefined));
     const startStateRef = yield* Ref.make<AcpStartState>({ _tag: "NotStarted" });
     const promptSerializationSemaphore = yield* Semaphore.make(1);
@@ -720,6 +738,17 @@ export const make = (
         promptSerializationSemaphore.withPermit(
           Effect.gen(function* () {
             const started = yield* getStartedState;
+            // A cancel that landed while this prompt waited for the semaphore is
+            // still on its way to the agent. Sending now would put this prompt
+            // in front of it and have it absorb the cancellation.
+            const pendingCancel = yield* Ref.getAndSet(cancelNotificationRef, Option.none());
+            if (Option.isSome(pendingCancel)) {
+              yield* Effect.ignore(
+                Deferred.await(pendingCancel.value).pipe(
+                  Effect.timeoutOption(CANCEL_NOTIFICATION_WRITE_TIMEOUT_MS),
+                ),
+              );
+            }
             yield* closeActiveAssistantSegment({
               queue: eventQueue,
               assistantSegmentRef,
@@ -767,13 +796,24 @@ export const make = (
       cancel: getStartedState.pipe(
         Effect.flatMap((started) =>
           Effect.gen(function* () {
+            // Published and forked before the interrupt, not after. Interrupting
+            // releases the prompt serialization semaphore at once, so a queued
+            // prompt could otherwise be sent to the agent ahead of this
+            // notification and be cancelled in place of the turn it was meant
+            // for. `prompt` waits on this deferred before sending.
+            const written = yield* Deferred.make<void>();
+            yield* Ref.set(cancelNotificationRef, Option.some(written));
+            yield* acp.agent.cancel({ sessionId: started.sessionId }).pipe(
+              Effect.ignore,
+              // Released however the send ends: a failed notification must not
+              // leave the next prompt waiting out the full timeout.
+              Effect.ensuring(Effect.ignore(Deferred.succeed(written, undefined))),
+              Effect.forkIn(runtimeScope),
+            );
             const activePromptFiber = yield* Ref.get(activePromptFiberRef);
             if (Option.isSome(activePromptFiber)) {
               yield* Fiber.interrupt(activePromptFiber.value).pipe(Effect.ignore);
             }
-            yield* acp.agent
-              .cancel({ sessionId: started.sessionId })
-              .pipe(Effect.ignore, Effect.forkIn(runtimeScope));
           }),
         ),
       ),
