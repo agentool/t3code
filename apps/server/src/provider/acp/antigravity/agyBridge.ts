@@ -1289,9 +1289,7 @@ function drain(input: {
       ...carried,
       ...allLines.map((line) => parseTranscriptLine(line)).filter((r) => r !== null),
     ];
-    if (carried.length === 0) {
-      input.state.deferredDrains = 0;
-    }
+
     // A deferral is a barrier, not a skip: everything after it is held too.
     // Emitting later records while an earlier one waits would put a tool's
     // output after text that followed it, and replay it out of order next pass.
@@ -1301,20 +1299,31 @@ function drain(input: {
     // order and any still unmatched are dropped, so an unhookable step costs
     // its own output rather than stalling everything behind it.
     const held = input.state.deferredRecords;
-    const releasing = input.final || input.state.deferredDrains >= MAX_DEFERRED_DRAINS;
+    // Only the record that actually waited out the bound is given up on, and
+    // only while it is still at the head. Applying its age to the whole batch
+    // would discard a record read moments ago that has had no chance at all.
+    const agedHead = carried.length > 0 && input.state.deferredDrains >= MAX_DEFERRED_DRAINS;
     for (let index = 0; index < records.length; index += 1) {
       const record = records[index];
       if (record === undefined) {
         continue;
       }
       const result = transcriptRecordUpdates(record, input.state);
-      if (result.deferred && !releasing) {
+      if (!result.deferred) {
+        // Something matched, so whatever was blocking the queue has cleared.
+        input.state.deferredDrains = 0;
+      } else if (input.final) {
+        // Nothing further is coming; holding it would only lose it silently.
+        continue;
+      } else if (index === 0 && agedHead) {
+        // Waited its full budget with no hook. Drop just this one and let the
+        // rest of the batch start over with a fresh budget.
+        input.state.deferredDrains = 0;
+        continue;
+      } else {
         held.push(...records.slice(index).filter((entry) => entry !== undefined));
         input.state.deferredDrains += 1;
         break;
-      }
-      if (result.deferred) {
-        continue;
       }
       for (const update of result.updates) {
         sendSessionUpdate(input.sessionId, update);
