@@ -236,23 +236,36 @@ function sendSessionUpdate(sessionId: string, update: AgySessionUpdate): void {
 let nextOutboundId = 1;
 const pendingOutbound = new Map<
   number,
-  { readonly resolve: (value: unknown) => void; readonly reject: (error: Error) => void }
+  {
+    readonly resolve: (value: unknown) => void;
+    readonly reject: (error: Error) => void;
+    /** Deadline for this request; cleared when it settles. */
+    timer?: ReturnType<typeof setTimeout>;
+  }
 >();
 
 function sendRequest(method: string, params: unknown, timeoutMs?: number): Promise<unknown> {
   const id = nextOutboundId;
   nextOutboundId += 1;
   return new Promise((resolve, reject) => {
-    pendingOutbound.set(id, { resolve, reject });
+    const pending: {
+      readonly resolve: (value: unknown) => void;
+      readonly reject: (error: Error) => void;
+      timer?: ReturnType<typeof setTimeout>;
+    } = { resolve, reject };
+    pendingOutbound.set(id, pending);
     if (timeoutMs !== undefined) {
       // A client that never answers would otherwise pin this entry for the
-      // life of the bridge process.
+      // life of the bridge process. Held on the entry so an answered request
+      // can drop it — `unref` keeps the timer from holding the loop open but
+      // still retains the closure until it fires.
       const timer = setTimeout(() => {
         if (pendingOutbound.delete(id)) {
           reject(new Error(`${method} timed out`));
         }
       }, timeoutMs);
       timer.unref?.();
+      pending.timer = timer;
     }
     writeMessage({ jsonrpc: "2.0", id, method, params });
   });
@@ -272,6 +285,9 @@ function resolveOutbound(message: Record<string, unknown>): boolean {
   if (!pending) {
     return false;
   }
+  if (pending.timer) {
+    clearTimeout(pending.timer);
+  }
   const error = message["error"];
   if (isRecord(error)) {
     const detail = typeof error["message"] === "string" ? error["message"] : "request failed";
@@ -285,6 +301,9 @@ function resolveOutbound(message: Record<string, unknown>): boolean {
 /** Reject everything still outstanding; used when the client goes away. */
 function failPendingOutbound(reason: string): void {
   for (const [, pending] of pendingOutbound) {
+    if (pending.timer) {
+      clearTimeout(pending.timer);
+    }
     pending.reject(new Error(reason));
   }
   pendingOutbound.clear();

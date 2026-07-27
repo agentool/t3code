@@ -1123,17 +1123,26 @@ export function makeAntigravityAdapter(
                       if (ctx.stopped) {
                         return;
                       }
-                      yield* offerRuntimeEvent({
-                        type: "turn.started",
+                      const startedEvent = {
+                        type: "turn.started" as const,
                         ...(yield* makeEventStamp()),
                         provider: PROVIDER,
                         threadId: input.threadId,
                         turnId,
                         payload: { model: ctx.session.model },
-                      });
-                      // Marked published only once the event is genuinely out, so
-                      // teardown never completes a turn that was merely reserved.
-                      ctx.publishedTurnIds.add(turnId);
+                      };
+                      // Published and recorded together. Marking only after the
+                      // event is out keeps teardown from completing a turn that
+                      // was merely reserved — but an interrupt between the two
+                      // would drop the reservation with the start already on
+                      // the wire, and settlement would owe a completion it did
+                      // not know about.
+                      yield* Effect.uninterruptible(
+                        Effect.gen(function* () {
+                          yield* offerRuntimeEvent(startedEvent);
+                          ctx.publishedTurnIds.add(turnId);
+                        }),
+                      );
                     }),
                   )
                   .pipe(
@@ -1211,52 +1220,66 @@ export function makeAntigravityAdapter(
               };
             }).pipe(
               Effect.ensuring(
-                Effect.gen(function* () {
-                  // One prompt per turn, so this settles unconditionally.
-                  // Cleared even when the turn never started — a model switch can
-                  // fail after `activeTurnId` is installed, and leaving it set
-                  // advertises a turn to `listSessions` and the reaper that no
-                  // longer exists. Only the event below depends on having started.
-                  if (ctx.activeTurnId === turnId) {
-                    ctx.activeTurnId = undefined;
-                  }
-                  // Read from shared state rather than this call's local flag: the
-                  // prompt that published `turn.started` may not be the one that
-                  // settles the turn, and the settler still owes the completion.
-                  const published = ctx.publishedTurnIds.has(turnId);
-                  ctx.publishedTurnIds.delete(turnId);
-                  ctx.reservedTurnIds.delete(turnId);
-                  // The public session field is what `listSessions` and the reaper
-                  // read, so leaving it set would advertise a turn that has ended.
-                  if (ctx.session.activeTurnId === turnId) {
-                    const { activeTurnId: _endedTurnId, ...endedSession } = ctx.session;
-                    ctx.session = { ...endedSession, status: "ready", updatedAt: yield* nowIso };
-                  }
-                  // A prompt that failed or was interrupted after `turn.started`
-                  // still owes consumers a terminal event; without one the turn
-                  // renders as running forever even though sendTurn already
-                  // returned an error.
-                  if (!published) {
-                    return;
-                  }
-                  const state =
-                    stopReason === "cancelled"
-                      ? "cancelled"
-                      : promptSucceeded
-                        ? "completed"
-                        : "failed";
-                  yield* offerRuntimeEvent({
-                    type: "turn.completed",
-                    ...(yield* makeEventStamp()),
-                    provider: PROVIDER,
-                    threadId: input.threadId,
-                    turnId,
-                    payload: { state, stopReason },
-                  });
-                  // `catchCause` rather than `catch`: a defect while stamping or
-                  // publishing would otherwise escape after the turn's prompt count
-                  // was already decremented, stranding the turn as running.
-                }).pipe(Effect.catchCause(() => Effect.void)),
+                // Settlement takes the same gate teardown does. It clears the
+                // published claim and then yields to stamp and publish; without
+                // the gate, a concurrent stop could see an empty set, decide it
+                // owed nothing, emit `session.exited`, and have this completion
+                // arrive after it. Whichever takes the gate first owns the
+                // terminal event, and the other finds nothing to publish.
+                ctx.lifecycleGate
+                  .withPermit(
+                    Effect.gen(function* () {
+                      // One prompt per turn, so this settles unconditionally.
+                      // Cleared even when the turn never started — a model switch can
+                      // fail after `activeTurnId` is installed, and leaving it set
+                      // advertises a turn to `listSessions` and the reaper that no
+                      // longer exists. Only the event below depends on having started.
+                      if (ctx.activeTurnId === turnId) {
+                        ctx.activeTurnId = undefined;
+                      }
+                      // Read from shared state rather than this call's local flag: the
+                      // prompt that published `turn.started` may not be the one that
+                      // settles the turn, and the settler still owes the completion.
+                      const published = ctx.publishedTurnIds.has(turnId);
+                      ctx.publishedTurnIds.delete(turnId);
+                      ctx.reservedTurnIds.delete(turnId);
+                      // The public session field is what `listSessions` and the reaper
+                      // read, so leaving it set would advertise a turn that has ended.
+                      if (ctx.session.activeTurnId === turnId) {
+                        const { activeTurnId: _endedTurnId, ...endedSession } = ctx.session;
+                        ctx.session = {
+                          ...endedSession,
+                          status: "ready",
+                          updatedAt: yield* nowIso,
+                        };
+                      }
+                      // A prompt that failed or was interrupted after `turn.started`
+                      // still owes consumers a terminal event; without one the turn
+                      // renders as running forever even though sendTurn already
+                      // returned an error.
+                      if (!published) {
+                        return;
+                      }
+                      const state =
+                        stopReason === "cancelled"
+                          ? "cancelled"
+                          : promptSucceeded
+                            ? "completed"
+                            : "failed";
+                      yield* offerRuntimeEvent({
+                        type: "turn.completed",
+                        ...(yield* makeEventStamp()),
+                        provider: PROVIDER,
+                        threadId: input.threadId,
+                        turnId,
+                        payload: { state, stopReason },
+                      });
+                      // `catchCause` rather than `catch`: a defect while stamping or
+                      // publishing would otherwise escape after the turn's prompt count
+                      // was already decremented, stranding the turn as running.
+                    }),
+                  )
+                  .pipe(Effect.catchCause(() => Effect.void)),
               ),
             );
           }),
@@ -1266,6 +1289,14 @@ export function makeAntigravityAdapter(
     const interruptTurn: AntigravityAdapterShape["interruptTurn"] = (threadId) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(threadId);
+        // Uninterruptible as a whole. The epoch moves first, so an interrupt
+        // partway would leave prompts refused against a fence the bridge never
+        // received — `agy` running on after Stop with nothing left to tell it.
+        yield* Effect.uninterruptible(cancelSequence(ctx, threadId));
+      });
+
+    const cancelSequence = (ctx: AntigravitySessionContext, threadId: ThreadId) =>
+      Effect.gen(function* () {
         // Recorded before anything else: prompts already accepted but still
         // queued upstream compare against this and refuse to submit.
         // Read and bumped in one synchronous step: everything accepted up to
