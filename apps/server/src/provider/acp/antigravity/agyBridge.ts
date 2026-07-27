@@ -1856,12 +1856,8 @@ async function runTurn(
   // whole, and leave the rest of that line to be read as a fragment.
   const stdoutDrainDeadline = Date.now() + STDOUT_DRAIN_GRACE_MS;
   let finalPasses = 0;
-  let transcriptRemains = true;
-  while (transcriptRemains && finalPasses < MAX_FINAL_DRAIN_PASSES) {
-    const stdoutDrainTimedOut = await waitForStdoutDrain(stdoutDrainDeadline);
-    if (stdoutDrainTimedOut) {
-      break;
-    }
+  let transcriptRemains: boolean;
+  do {
     transcriptRemains = drain({
       sessionId,
       hookDir,
@@ -1875,12 +1871,19 @@ async function runTurn(
       final: false,
     });
     finalPasses += 1;
-  }
+    if (!transcriptRemains || finalPasses >= MAX_FINAL_DRAIN_PASSES) {
+      break;
+    }
+    const stdoutDrainTimedOut = await waitForStdoutDrain(stdoutDrainDeadline);
+    if (stdoutDrainTimedOut) {
+      break;
+    }
+  } while (transcriptRemains);
   if (transcriptRemains) {
-    // The budget ran out with bytes still unread. Flushing the cursor now would
-    // present a half-written line as a whole record and then abandon the rest
-    // in silence, so the partial line is dropped and the shortfall is said out
-    // loud instead.
+    // Final draining stopped with bytes still unread. Flushing the cursor now
+    // would present a half-written line as a whole record and then abandon the
+    // rest in silence, so the partial line is dropped and the shortfall is said
+    // out loud instead.
     cursor.flush();
     await waitForStdoutDrain(stdoutDrainDeadline);
     sendSessionUpdate(sessionId, {
