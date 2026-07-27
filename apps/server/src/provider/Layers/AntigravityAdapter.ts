@@ -603,9 +603,19 @@ export function makeAntigravityAdapter(
           yield* acp.handleRequestPermission((params) =>
             mapAcpCallbackFailure(
               Effect.gen(function* () {
-                // A request arriving after teardown has no live turn behind it,
-                // so it must not be auto-approved on the way out.
-                if (ctx?.stopped) {
+                // Bound to the turn actually running, with the epoch that turn
+                // was accepted at — not the session's current epoch. A request
+                // from a cancelled turn can arrive after the epoch moved, and
+                // reading the live value would make it look current.
+                const approvalTurnId = ctx?.submittingTurnId ?? ctx?.activeTurnId;
+                const approvalEpoch = ctx?.activeTurnEpoch;
+                const turnCancelled =
+                  approvalEpoch !== undefined &&
+                  ctx !== undefined &&
+                  approvalEpoch !== ctx.cancelEpoch;
+                // Checked before auto-approval, not after: teardown or a Stop
+                // must not be waved through by full access.
+                if (ctx?.stopped || turnCancelled) {
                   return { outcome: { outcome: "cancelled" } as const };
                 }
                 if (input.runtimeMode === "full-access") {
@@ -615,7 +625,6 @@ export function makeAntigravityAdapter(
                   }
                 }
                 const permissionRequest = parsePermissionRequest(params);
-                const approvalEpoch = ctx?.cancelEpoch;
                 const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
                 const decision = yield* Deferred.make<ProviderApprovalDecision>();
                 const turnId = sessions.get(input.threadId)?.activeTurnId;
@@ -625,7 +634,7 @@ export function makeAntigravityAdapter(
                     stamp: yield* makeEventStamp(),
                     provider: PROVIDER,
                     threadId: input.threadId,
-                    turnId,
+                    turnId: approvalTurnId,
                     requestId: RuntimeRequestId.make(requestId),
                     permissionRequest,
                     detail: permissionRequest.detail ?? "Antigravity tool call",
@@ -660,7 +669,9 @@ export function makeAntigravityAdapter(
                 );
                 // Re-checked at the moment of answering: an approval decided
                 // while Stop was landing must not come back as an allow.
-                const stillLive = !ctx?.stopped && ctx?.cancelEpoch === approvalEpoch;
+                const stillLive =
+                  !ctx?.stopped &&
+                  (approvalEpoch === undefined || ctx?.cancelEpoch === approvalEpoch);
                 const optionId =
                   resolved === "cancel" || !stillLive
                     ? undefined
@@ -929,6 +940,18 @@ export function makeAntigravityAdapter(
         // concurrent calls both observe zero and open rival turns over the
         // same thread.
         const freshTurnId = TurnId.make(yield* randomUUIDv4);
+        // Rechecked here, after the last yield and before any turn state is
+        // touched. A prompt that stalled in preparation can resume once a Stop
+        // has landed and a newer turn has claimed the pointer; claiming here
+        // would overwrite that pointer and then clear it again on the way out,
+        // leaving the newer turn counted but unreachable.
+        if (ctx.stopped || ctx.cancelEpoch !== acceptedEpoch) {
+          return {
+            threadId: input.threadId,
+            turnId: freshTurnId,
+            resumeCursor: ctx.session.resumeCursor,
+          };
+        }
         // Same epoch only: a prompt accepted after a Stop must not fold into the
         // turn that Stop cancelled, or it would inherit its id and publish a
         // completion for it while the cancelled one is still settling.

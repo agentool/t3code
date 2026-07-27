@@ -856,9 +856,11 @@ function cancelledThrough(sessionId: string): number {
   return cancelledThroughEpoch.get(sessionId) ?? -1;
 }
 
-/** Whether this session's client uses the epoch extension. */
-function usesEpochs(sessionId: string): boolean {
-  return cancelledThroughEpoch.has(sessionId);
+/** Prompts accepted for a session but not yet handled, by session id. */
+const queuedPromptCounts = new Map<string, number>();
+
+function queuedPrompts(sessionId: string): number {
+  return queuedPromptCounts.get(sessionId) ?? 0;
 }
 
 /** The adapter's cancel epoch for a submission, carried in `_meta.t3.epoch`. */
@@ -1400,10 +1402,12 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
     case "session/cancel": {
       const sessionId = typeof params["sessionId"] === "string" ? params["sessionId"] : undefined;
       if (sessionId && sessions.has(sessionId) && sessionId !== activeTurnSessionId) {
-        // No turn running for it yet. A fencing client has already raised the
-        // mark, so its queued prompt is covered; one that does not fence needs
-        // this marker or its queued prompt would start after the cancel.
-        if (!usesEpochs(sessionId)) {
+        // No turn running for it yet. Banked only when a prompt is genuinely
+        // waiting: a cancel that merely arrived after its own turn finished
+        // would otherwise sit here and stop something sent much later. A prompt
+        // carrying an epoch is already covered by the mark and consumes no
+        // marker, so this only ever applies to an untagged one.
+        if (queuedPrompts(sessionId) > 0) {
           unscopedCancels.add(sessionId);
         }
         return;
@@ -1414,15 +1418,11 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
         // higher epoch and must survive this notification, which the runtime
         // forks and can therefore deliver late.
         //
-        // An untagged turn is cancelled outright — plain ACP behaviour — but
-        // only when this session's client never fences. In a session that does,
-        // a delayed cancel belonging to an already-fenced turn would otherwise
-        // kill an untagged follow-up that started in the meantime.
-        const unscoped = activeTurnEpoch === undefined && !usesEpochs(sessionId);
-        if (
-          unscoped ||
-          (activeTurnEpoch !== undefined && activeTurnEpoch <= cancelledThrough(sessionId))
-        ) {
+        // Judged by the running turn's own mode, not by anything the session
+        // did earlier. A turn whose prompt carried no epoch cannot be scoped by
+        // a mark it never contributed to, so it takes plain ACP semantics; one
+        // that carried an epoch is stopped only if that epoch was cancelled.
+        if (activeTurnEpoch === undefined || activeTurnEpoch <= cancelledThrough(sessionId)) {
           cancelledSessions.add(sessionId);
           activeChild?.kill("SIGTERM");
         }
@@ -1490,8 +1490,27 @@ export async function runAgyBridge(): Promise<void> {
         continue;
       }
       const pending = message;
+      // Counted from acceptance to handling, so a cancel can tell "a prompt is
+      // waiting" from "nothing is outstanding".
+      const queuedSessionId =
+        pending["method"] === "session/prompt"
+          ? (pending["params"] as Record<string, unknown> | undefined)?.["sessionId"]
+          : undefined;
+      if (typeof queuedSessionId === "string") {
+        queuedPromptCounts.set(queuedSessionId, queuedPrompts(queuedSessionId) + 1);
+      }
       queue = queue
         .then(() => handleRequest(pending))
+        .finally(() => {
+          if (typeof queuedSessionId === "string") {
+            const remaining = queuedPrompts(queuedSessionId) - 1;
+            if (remaining > 0) {
+              queuedPromptCounts.set(queuedSessionId, remaining);
+            } else {
+              queuedPromptCounts.delete(queuedSessionId);
+            }
+          }
+        })
         .catch((error: unknown) => {
           // Every request must be answered. Swallowing a handler failure would
           // leave the client blocked on a response that never arrives.
