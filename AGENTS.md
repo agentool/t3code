@@ -73,6 +73,10 @@ Known constraints, all inherent to print mode:
   boundary the approval gate draws: code the user has already approved can do as it likes,
   including backgrounding itself. Reaping those would need a supervisor process that stays
   in the group, or a Windows Job Object — neither reachable in plain Node.
+  The bridge also kills its child group on SIGTERM, SIGINT and normal exit, but a SIGKILL of
+  the bridge itself runs no handler, and `agy` is then reparented to init. POSIX offers no
+  portable parent-death signal (`PR_SET_PDEATHSIG` is Linux-only and not exposed by Node), so
+  a force-killed bridge can leave one `agy` behind until its `--print-timeout` elapses.
 - Any `agy` subcommand spawned for a probe must set `stdin: "ignore"`. `agy` starts a language
   server and will not emit output while stdin stays open, so the default `"pipe"` hangs it.
 
