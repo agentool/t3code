@@ -79,6 +79,11 @@ Known constraints, all inherent to print mode:
   a force-killed bridge can leave one `agy` behind until its `--print-timeout` elapses.
 - Any `agy` subcommand spawned for a probe must set `stdin: "ignore"`. `agy` starts a language
   server and will not emit output while stdin stays open, so the default `"pipe"` hangs it.
+- Approval, cancellation, process teardown and decision forgery are covered by live checks in
+  `scripts/antigravity-e2e/`, not by the unit suite — they drive the real CLI and cost quota, so
+  they are run by hand. Run them after changing `agyBridge.ts`, `AntigravityAdapter.ts` or
+  `AcpSessionRuntime.ts`; every serious defect found while building this provider was in a path
+  only those checks reach.
 - Runtime events are buffered without a cap, so a subscriber that stops consuming grows memory
   until it resumes. This is the shape every adapter uses — Claude, Codex, Cursor, Grok and
   OpenCode all publish through an unbounded queue or pub/sub, as does `ProviderService` itself —
