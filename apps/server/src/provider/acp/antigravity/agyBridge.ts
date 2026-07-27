@@ -828,6 +828,12 @@ interface TurnOutcome {
 let activeChild: NodeChildProcess.ChildProcess | null = null;
 /** Session whose turn is currently running, if any. Gates `session/cancel`. */
 let activeTurnSessionId: string | null = null;
+/**
+ * Set once stdin closes. Queued prompts decline instead of spawning: killing
+ * only the running child let the queue advance and start another `agy` after
+ * the client had gone, which then ran to the print timeout.
+ */
+let shuttingDown = false;
 const cancelledSessions = new Set<string>();
 /**
  * Highest cancelled epoch per session.
@@ -856,11 +862,16 @@ function cancelledThrough(sessionId: string): number {
   return cancelledThroughEpoch.get(sessionId) ?? -1;
 }
 
-/** Prompts accepted for a session but not yet handled, by session id. */
-const queuedPromptCounts = new Map<string, number>();
+/**
+ * Prompts accepted for a session but not yet handled, counting only those that
+ * carry no epoch. A tagged prompt is already covered by the session's mark and
+ * consumes no marker, so banking a cancel on its account would leave an entry
+ * that only some later untagged prompt could consume.
+ */
+const queuedUntaggedCounts = new Map<string, number>();
 
-function queuedPrompts(sessionId: string): number {
-  return queuedPromptCounts.get(sessionId) ?? 0;
+function queuedUntagged(sessionId: string): number {
+  return queuedUntaggedCounts.get(sessionId) ?? 0;
 }
 
 /** The adapter's cancel epoch for a submission, carried in `_meta.t3.epoch`. */
@@ -1342,6 +1353,12 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
         sendError(id, -32602, "unknown sessionId");
         return;
       }
+      if (shuttingDown) {
+        // The client is gone; starting `agy` now would leave it running with
+        // nobody to read its output.
+        sendResult(id, { stopReason: "cancelled" });
+        return;
+      }
       // Compared against the session's cancelled high-water mark. A cancel
       // that outran this prompt raised that mark, and anything the user sends
       // afterwards carries a higher epoch and is unaffected.
@@ -1407,7 +1424,7 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
         // would otherwise sit here and stop something sent much later. A prompt
         // carrying an epoch is already covered by the mark and consumes no
         // marker, so this only ever applies to an untagged one.
-        if (queuedPrompts(sessionId) > 0) {
+        if (queuedUntagged(sessionId) > 0) {
           unscopedCancels.add(sessionId);
         }
         return;
@@ -1492,22 +1509,29 @@ export async function runAgyBridge(): Promise<void> {
       const pending = message;
       // Counted from acceptance to handling, so a cancel can tell "a prompt is
       // waiting" from "nothing is outstanding".
-      const queuedSessionId =
+      const queuedParams =
         pending["method"] === "session/prompt"
-          ? (pending["params"] as Record<string, unknown> | undefined)?.["sessionId"]
+          ? (pending["params"] as Record<string, unknown> | undefined)
+          : undefined;
+      const queuedSessionId =
+        queuedParams && promptEpochOf(queuedParams) === undefined
+          ? queuedParams["sessionId"]
           : undefined;
       if (typeof queuedSessionId === "string") {
-        queuedPromptCounts.set(queuedSessionId, queuedPrompts(queuedSessionId) + 1);
+        queuedUntaggedCounts.set(queuedSessionId, queuedUntagged(queuedSessionId) + 1);
       }
       queue = queue
         .then(() => handleRequest(pending))
         .finally(() => {
           if (typeof queuedSessionId === "string") {
-            const remaining = queuedPrompts(queuedSessionId) - 1;
+            const remaining = queuedUntagged(queuedSessionId) - 1;
             if (remaining > 0) {
-              queuedPromptCounts.set(queuedSessionId, remaining);
+              queuedUntaggedCounts.set(queuedSessionId, remaining);
             } else {
-              queuedPromptCounts.delete(queuedSessionId);
+              queuedUntaggedCounts.delete(queuedSessionId);
+              // Nothing untagged is waiting any more, so a marker banked for
+              // one cannot be consumed and must not outlive it.
+              unscopedCancels.delete(queuedSessionId);
             }
           }
         })
@@ -1522,6 +1546,8 @@ export async function runAgyBridge(): Promise<void> {
     }
   }
 
+  // Recorded before anything else so queued prompts see it and decline.
+  shuttingDown = true;
   // stdin closed: no approval can still be answered, so unblock the hooks
   // waiting on them (they fail closed) rather than letting them time out.
   failPendingOutbound("T3 Code disconnected before approving this tool call");

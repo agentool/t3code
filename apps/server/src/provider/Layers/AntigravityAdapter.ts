@@ -180,28 +180,9 @@ interface AntigravitySessionContext {
   /** Cancel epoch the active turn belongs to; steering is scoped to it. */
   activeTurnEpoch: number;
   /**
-   * Turn whose prompt currently owns the submission gate.
-   *
-   * Streamed events belong to whichever turn the bridge is actually running,
-   * which is not always the newest: after a Stop a fresh turn can be announced
-   * while the cancelled turn's final updates are still being consumed, and
-   * attributing those to the newcomer files one turn's output under another.
-   */
-  submittingTurnId: TurnId | undefined;
-  /**
    * Number of prompts in flight. >0 means a turn is running, so a new
    * sendTurn steers the existing turn rather than opening a new one.
    */
-  /**
-   * Prompts still in flight, counted per turn rather than per session.
-   *
-   * A shared counter breaks as soon as two turns overlap, which epoch-scoped
-   * steering makes possible: a prompt sent after a Stop opens its own turn
-   * while the cancelled one is still settling. Whichever finished first would
-   * see the other's prompt in the count, decide it was not the last, and skip
-   * its terminal event — orphaning that turn.
-   */
-  readonly promptsInFlightByTurn: Map<TurnId, number>;
   stopped: boolean;
 }
 
@@ -448,9 +429,6 @@ export function makeAntigravityAdapter(
             const claimed = [...ctx.publishedTurnIds];
             ctx.publishedTurnIds.clear();
             ctx.reservedTurnIds.clear();
-            // Counts go with the turns they belonged to; a finalizer waking
-            // later finds nothing outstanding and settles nothing.
-            ctx.promptsInFlightByTurn.clear();
             ctx.activeTurnId = undefined;
             return claimed;
           }),
@@ -607,7 +585,7 @@ export function makeAntigravityAdapter(
                 // was accepted at — not the session's current epoch. A request
                 // from a cancelled turn can arrive after the epoch moved, and
                 // reading the live value would make it look current.
-                const approvalTurnId = ctx?.submittingTurnId ?? ctx?.activeTurnId;
+                const approvalTurnId = ctx?.activeTurnId;
                 const approvalEpoch = ctx?.activeTurnEpoch;
                 const turnCancelled =
                   approvalEpoch !== undefined &&
@@ -728,8 +706,6 @@ export function makeAntigravityAdapter(
             approvals: pendingApprovals,
             acpSessionId: started.sessionId,
             activeTurnEpoch: -1,
-            submittingTurnId: undefined,
-            promptsInFlightByTurn: new Map(),
             stopped: false,
           };
 
@@ -749,7 +725,7 @@ export function makeAntigravityAdapter(
                         stamp: yield* makeEventStamp(),
                         provider: PROVIDER,
                         threadId: ctx.threadId,
-                        turnId: ctx.submittingTurnId ?? ctx.activeTurnId,
+                        turnId: ctx.activeTurnId,
                         itemId: event.itemId,
                         lifecycle: "item.started",
                       }),
@@ -761,7 +737,7 @@ export function makeAntigravityAdapter(
                         stamp: yield* makeEventStamp(),
                         provider: PROVIDER,
                         threadId: ctx.threadId,
-                        turnId: ctx.submittingTurnId ?? ctx.activeTurnId,
+                        turnId: ctx.activeTurnId,
                         itemId: event.itemId,
                         lifecycle: "item.completed",
                       }),
@@ -774,7 +750,7 @@ export function makeAntigravityAdapter(
                         stamp: yield* makeEventStamp(),
                         provider: PROVIDER,
                         threadId: ctx.threadId,
-                        turnId: ctx.submittingTurnId ?? ctx.activeTurnId,
+                        turnId: ctx.activeTurnId,
                         payload: event.payload,
                         source: "acp.jsonrpc",
                         method: "session/update",
@@ -789,7 +765,7 @@ export function makeAntigravityAdapter(
                         stamp: yield* makeEventStamp(),
                         provider: PROVIDER,
                         threadId: ctx.threadId,
-                        turnId: ctx.submittingTurnId ?? ctx.activeTurnId,
+                        turnId: ctx.activeTurnId,
                         toolCall: event.toolCall,
                         rawPayload: event.rawPayload,
                       }),
@@ -802,7 +778,7 @@ export function makeAntigravityAdapter(
                         stamp: yield* makeEventStamp(),
                         provider: PROVIDER,
                         threadId: ctx.threadId,
-                        turnId: ctx.submittingTurnId ?? ctx.activeTurnId,
+                        turnId: ctx.activeTurnId,
                         ...(event.itemId ? { itemId: event.itemId } : {}),
                         text: event.text,
                         rawPayload: event.rawPayload,
@@ -930,159 +906,151 @@ export function makeAntigravityAdapter(
           });
         }
 
-        // A sendTurn while a prompt is in flight is a steer: the new prompt
-        // folds into the ongoing work, so the active turn id is reused.
-        //
-        // The id is minted first, before anything is read, so that reading
-        // the turn's prompt count and claiming it are one synchronous step.
-        // Yielding
-        // between the two — which generating the id here used to do — let two
-        // concurrent calls both observe zero and open rival turns over the
-        // same thread.
         const freshTurnId = TurnId.make(yield* randomUUIDv4);
-        // Rechecked here, after the last yield and before any turn state is
-        // touched. A prompt that stalled in preparation can resume once a Stop
-        // has landed and a newer turn has claimed the pointer; claiming here
-        // would overwrite that pointer and then clear it again on the way out,
-        // leaving the newer turn counted but unreachable.
-        if (ctx.stopped || ctx.cancelEpoch !== acceptedEpoch) {
-          return {
-            threadId: input.threadId,
-            turnId: freshTurnId,
-            resumeCursor: ctx.session.resumeCursor,
-          };
-        }
-        // Same epoch only: a prompt accepted after a Stop must not fold into the
-        // turn that Stop cancelled, or it would inherit its id and publish a
-        // completion for it while the cancelled one is still settling.
-        const activeTurnBusy =
-          ctx.activeTurnId !== undefined &&
-          (ctx.promptsInFlightByTurn.get(ctx.activeTurnId) ?? 0) > 0;
-        const steeringTurnId =
-          activeTurnBusy && ctx.activeTurnEpoch === acceptedEpoch ? ctx.activeTurnId : undefined;
-        const turnId = steeringTurnId ?? freshTurnId;
-        // Claimed together, without an intervening yield: assigning the active
-        // turn id later let a concurrent call see a busy turn with no
-        // id yet and open a rival turn.
-        ctx.promptsInFlightByTurn.set(turnId, (ctx.promptsInFlightByTurn.get(turnId) ?? 0) + 1);
-        ctx.activeTurnId = turnId;
-        ctx.activeTurnEpoch = acceptedEpoch;
-        // Terminal-event bookkeeping. Publication happens in exactly one place
-        // (the teardown below) so that the decision cannot race a steer.
-        let stopReason: string | null = null;
-        let promptSucceeded = false;
 
-        return yield* Effect.gen(function* () {
-          ctx.session = {
-            ...ctx.session,
-            activeTurnId: turnId,
-            updatedAt: yield* nowIso,
-          };
+        // The submission gate is taken before the turn is claimed, not after.
+        //
+        // Claiming outside it let two turns exist at once — a prompt sent after
+        // a Stop opened its own while the cancelled one was still settling —
+        // and everything that reads "the current turn" then has to guess which
+        // one it means: streamed events, permission requests, the epoch a
+        // decision is checked against. Guarding each of those in turn produced
+        // a new mismatch every time. Inside the gate there is exactly one live
+        // turn, so there is nothing to disambiguate.
+        //
+        // This costs nothing in practice: `acp.prompt` already serializes on
+        // its own semaphore, so a second prompt could never reach `agy` early
+        // anyway — only its bookkeeping ran ahead.
+        return yield* ctx.promptGate.withPermit(
+          Effect.gen(function* () {
+            // Rechecked with the gate held and before any turn state is
+            // touched. Waiting for the gate is exactly when a Stop can land.
+            if (ctx.stopped || ctx.cancelEpoch !== acceptedEpoch) {
+              return {
+                threadId: input.threadId,
+                turnId: freshTurnId,
+                resumeCursor: ctx.session.resumeCursor,
+              };
+            }
+            // Each prompt is its own turn. Steering used to fold a second
+            // prompt into a running turn, but `agy --print` cannot inject into
+            // a running invocation — the second prompt always became its own
+            // `agy` process, and the merge existed only in the bookkeeping.
+            // Holding the gate makes that explicit: by the time this runs, any
+            // earlier prompt has already settled.
+            const turnId = freshTurnId;
+            ctx.activeTurnId = turnId;
+            ctx.activeTurnEpoch = acceptedEpoch;
+            let stopReason: string | null = null;
+            let promptSucceeded = false;
 
-          // `agy` binds the model with a `--model` flag on each spawn, and that
-          // flag composes with `--conversation` — verified against the CLI: a
-          // resumed conversation answers on the new model with its history
-          // intact. Applied before `turn.started` so the announced model is the
-          // one the turn actually runs on.
-          const turnModelSelection =
-            input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
-          const requestedModelId = turnModelSelection?.model
-            ? resolveAntigravityBaseModelId(turnModelSelection.model)
-            : undefined;
-          if (requestedModelId !== undefined && requestedModelId !== ctx.currentModelId) {
-            yield* ctx.acp
-              .setSessionModel(requestedModelId)
-              .pipe(
-                Effect.mapError((cause) =>
-                  mapAcpToAdapterError(PROVIDER, input.threadId, "session/set_model", cause),
-                ),
-              );
-            ctx.currentModelId = requestedModelId;
-            ctx.session = { ...ctx.session, model: turnModelSelection?.model ?? ctx.session.model };
-          }
+            return yield* Effect.gen(function* () {
+              ctx.session = {
+                ...ctx.session,
+                activeTurnId: turnId,
+                updatedAt: yield* nowIso,
+              };
 
-          // Rechecked before anything is announced: everything above yields, so
-          // the session can be stopped or the turn interrupted while
-          // attachments resolve and the model is selected. Announcing a turn
-          // on a closed runtime would emit events after `session.exited`.
-          if (ctx.cancelEpoch !== acceptedEpoch || ctx.stopped) {
-            stopReason = "cancelled";
-            return {
-              threadId: input.threadId,
-              turnId,
-              resumeCursor: ctx.session.resumeCursor,
-            };
-          }
-
-          // Claimed from shared state, not from "am I a steer": the prompt this
-          // one folded into may have failed before it announced anything, and
-          // emitting content for a turn that never started strands the UI.
-          //
-          // Test and claim are one synchronous step — publishing first and
-          // marking afterwards let two concurrent steers both find the turn
-          // unannounced and emit `turn.started` twice. The claim is released
-          // again if publication does not happen, so a turn nobody saw start
-          // cannot later be completed.
-          // Reservation is taken under the lifecycle gate so teardown cannot
-          // snapshot between the check and the claim.
-          const announcing = yield* ctx.lifecycleGate.withPermit(
-            Effect.sync(() => {
-              if (ctx.stopped || ctx.reservedTurnIds.has(turnId)) {
-                return false;
+              // `agy` binds the model with a `--model` flag on each spawn, and that
+              // flag composes with `--conversation` — verified against the CLI: a
+              // resumed conversation answers on the new model with its history
+              // intact. Applied before `turn.started` so the announced model is the
+              // one the turn actually runs on.
+              const turnModelSelection =
+                input.modelSelection?.instanceId === boundInstanceId
+                  ? input.modelSelection
+                  : undefined;
+              const requestedModelId = turnModelSelection?.model
+                ? resolveAntigravityBaseModelId(turnModelSelection.model)
+                : undefined;
+              if (requestedModelId !== undefined && requestedModelId !== ctx.currentModelId) {
+                yield* ctx.acp
+                  .setSessionModel(requestedModelId)
+                  .pipe(
+                    Effect.mapError((cause) =>
+                      mapAcpToAdapterError(PROVIDER, input.threadId, "session/set_model", cause),
+                    ),
+                  );
+                ctx.currentModelId = requestedModelId;
+                ctx.session = {
+                  ...ctx.session,
+                  model: turnModelSelection?.model ?? ctx.session.model,
+                };
               }
-              ctx.reservedTurnIds.add(turnId);
-              return true;
-            }),
-          );
-          if (announcing) {
-            // Stamp generation sits inside the guarded region: it can fail or
-            // be interrupted too, and a claim left behind without its event
-            // would make a steer skip the start and let settlement publish an
-            // orphan completion.
-            yield* ctx.lifecycleGate
-              .withPermit(
-                Effect.gen(function* () {
-                  // Re-checked inside the gate: teardown may have run while
-                  // this fiber waited for it, and a start published after
-                  // `session.exited` is worse than no start at all.
-                  if (ctx.stopped) {
-                    return;
-                  }
-                  yield* offerRuntimeEvent({
-                    type: "turn.started",
-                    ...(yield* makeEventStamp()),
-                    provider: PROVIDER,
-                    threadId: input.threadId,
-                    turnId,
-                    payload: { model: ctx.session.model },
-                  });
-                  // Marked published only once the event is genuinely out, so
-                  // teardown never completes a turn that was merely reserved.
-                  ctx.publishedTurnIds.add(turnId);
-                }),
-              )
-              .pipe(
-                Effect.onExit((exit) =>
-                  Exit.isSuccess(exit)
-                    ? Effect.void
-                    : Effect.sync(() => ctx.reservedTurnIds.delete(turnId)),
-                ),
-              );
-          }
 
-          const result = yield* ctx.promptGate
-            .withPermit(
-              Effect.gen(function* () {
-                // Re-read once submission actually begins. Waiting for the gate
-                // is exactly the window in which Stop can land, and a prompt that
-                // reached the bridge after a cancel would spawn `agy` anyway.
+              // Rechecked before anything is announced: everything above yields, so
+              // the session can be stopped or the turn interrupted while
+              // attachments resolve and the model is selected. Announcing a turn
+              // on a closed runtime would emit events after `session.exited`.
+              if (ctx.cancelEpoch !== acceptedEpoch || ctx.stopped) {
+                stopReason = "cancelled";
+                return {
+                  threadId: input.threadId,
+                  turnId,
+                  resumeCursor: ctx.session.resumeCursor,
+                };
+              }
+
+              // Claimed from shared state, not from "am I a steer": the prompt this
+              // one folded into may have failed before it announced anything, and
+              // emitting content for a turn that never started strands the UI.
+              //
+              // Test and claim are one synchronous step — publishing first and
+              // marking afterwards let two concurrent steers both find the turn
+              // unannounced and emit `turn.started` twice. The claim is released
+              // again if publication does not happen, so a turn nobody saw start
+              // cannot later be completed.
+              // Reservation is taken under the lifecycle gate so teardown cannot
+              // snapshot between the check and the claim.
+              const announcing = yield* ctx.lifecycleGate.withPermit(
+                Effect.sync(() => {
+                  if (ctx.stopped || ctx.reservedTurnIds.has(turnId)) {
+                    return false;
+                  }
+                  ctx.reservedTurnIds.add(turnId);
+                  return true;
+                }),
+              );
+              if (announcing) {
+                // Stamp generation sits inside the guarded region: it can fail or
+                // be interrupted too, and a claim left behind without its event
+                // would make a steer skip the start and let settlement publish an
+                // orphan completion.
+                yield* ctx.lifecycleGate
+                  .withPermit(
+                    Effect.gen(function* () {
+                      // Re-checked inside the gate: teardown may have run while
+                      // this fiber waited for it, and a start published after
+                      // `session.exited` is worse than no start at all.
+                      if (ctx.stopped) {
+                        return;
+                      }
+                      yield* offerRuntimeEvent({
+                        type: "turn.started",
+                        ...(yield* makeEventStamp()),
+                        provider: PROVIDER,
+                        threadId: input.threadId,
+                        turnId,
+                        payload: { model: ctx.session.model },
+                      });
+                      // Marked published only once the event is genuinely out, so
+                      // teardown never completes a turn that was merely reserved.
+                      ctx.publishedTurnIds.add(turnId);
+                    }),
+                  )
+                  .pipe(
+                    Effect.onExit((exit) =>
+                      Exit.isSuccess(exit)
+                        ? Effect.void
+                        : Effect.sync(() => ctx.reservedTurnIds.delete(turnId)),
+                    ),
+                  );
+              }
+
+              const result = yield* Effect.gen(function* () {
                 if (ctx.cancelEpoch !== acceptedEpoch || ctx.stopped) {
                   return undefined;
                 }
-                // Owned from here until after the drain below, so this turn's
-                // streamed events stay attributed to it even once a newer turn
-                // has been announced.
-                ctx.submittingTurnId = turnId;
                 // The bridge writes its `session/update` notifications before
                 // the prompt response, but the runtime only queues them.
                 // Draining inside the gate keeps the turn from settling — and
@@ -1108,110 +1076,92 @@ export function makeAntigravityAdapter(
                   .pipe(
                     Effect.tapCause(() => drain),
                     Effect.tap(() => drain),
-                    // Released only after the drain, so events this turn queued
-                    // are still attributed to it.
-                    Effect.ensuring(
-                      Effect.sync(() => {
-                        if (ctx.submittingTurnId === turnId) {
-                          ctx.submittingTurnId = undefined;
-                        }
-                      }),
-                    ),
                   );
-              }),
-            )
-            .pipe(
-              Effect.mapError((error) =>
-                mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
-              ),
-            );
-          if (result === undefined) {
-            stopReason = "cancelled";
-            return {
-              threadId: input.threadId,
-              turnId,
-              resumeCursor: ctx.session.resumeCursor,
-            };
-          }
+              }).pipe(
+                Effect.mapError((error) =>
+                  mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
+                ),
+              );
+              if (result === undefined) {
+                stopReason = "cancelled";
+                return {
+                  threadId: input.threadId,
+                  turnId,
+                  resumeCursor: ctx.session.resumeCursor,
+                };
+              }
 
-          const turnRecord = ctx.turns.find((turn) => turn.id === turnId);
-          if (turnRecord) {
-            turnRecord.items.push({ prompt: promptParts, result });
-          } else {
-            ctx.turns.push({ id: turnId, items: [{ prompt: promptParts, result }] });
-          }
-          ctx.session = {
-            ...ctx.session,
-            activeTurnId: turnId,
-            updatedAt: yield* nowIso,
-          };
-
-          promptSucceeded = true;
-          stopReason = result.stopReason ?? null;
-
-          return {
-            threadId: input.threadId,
-            turnId,
-            resumeCursor: ctx.session.resumeCursor,
-          };
-        }).pipe(
-          Effect.ensuring(
-            Effect.gen(function* () {
-              // Decrement and the last-prompt test are one synchronous step, so
-              // a steer arriving mid-settlement cannot make two prompts both
-              // believe they own the turn and publish a terminal event each.
-              // Scoped to this turn: another turn's prompts must not keep this
-              // one from settling, nor settle it on their behalf.
-              const remaining = Math.max(0, (ctx.promptsInFlightByTurn.get(turnId) ?? 1) - 1);
-              if (remaining > 0) {
-                ctx.promptsInFlightByTurn.set(turnId, remaining);
+              const turnRecord = ctx.turns.find((turn) => turn.id === turnId);
+              if (turnRecord) {
+                turnRecord.items.push({ prompt: promptParts, result });
               } else {
-                ctx.promptsInFlightByTurn.delete(turnId);
+                ctx.turns.push({ id: turnId, items: [{ prompt: promptParts, result }] });
               }
-              if (remaining > 0) {
-                return;
-              }
-              // Cleared even when the turn never started — a model switch can
-              // fail after `activeTurnId` is installed, and leaving it set
-              // advertises a turn to `listSessions` and the reaper that no
-              // longer exists. Only the event below depends on having started.
-              if (ctx.activeTurnId === turnId) {
-                ctx.activeTurnId = undefined;
-              }
-              // Read from shared state rather than this call's local flag: the
-              // prompt that published `turn.started` may not be the one that
-              // settles the turn, and the settler still owes the completion.
-              const published = ctx.publishedTurnIds.has(turnId);
-              ctx.publishedTurnIds.delete(turnId);
-              ctx.reservedTurnIds.delete(turnId);
-              // The public session field is what `listSessions` and the reaper
-              // read, so leaving it set would advertise a turn that has ended.
-              if (ctx.session.activeTurnId === turnId) {
-                const { activeTurnId: _endedTurnId, ...endedSession } = ctx.session;
-                ctx.session = { ...endedSession, status: "ready", updatedAt: yield* nowIso };
-              }
-              // A prompt that failed or was interrupted after `turn.started`
-              // still owes consumers a terminal event; without one the turn
-              // renders as running forever even though sendTurn already
-              // returned an error.
-              if (!published) {
-                return;
-              }
-              const state =
-                stopReason === "cancelled" ? "cancelled" : promptSucceeded ? "completed" : "failed";
-              yield* offerRuntimeEvent({
-                type: "turn.completed",
-                ...(yield* makeEventStamp()),
-                provider: PROVIDER,
+              ctx.session = {
+                ...ctx.session,
+                activeTurnId: turnId,
+                updatedAt: yield* nowIso,
+              };
+
+              promptSucceeded = true;
+              stopReason = result.stopReason ?? null;
+
+              return {
                 threadId: input.threadId,
                 turnId,
-                payload: { state, stopReason },
-              });
-              // `catchCause` rather than `catch`: a defect while stamping or
-              // publishing would otherwise escape after the turn's prompt count
-              // was already decremented, stranding the turn as running.
-            }).pipe(Effect.catchCause(() => Effect.void)),
-          ),
+                resumeCursor: ctx.session.resumeCursor,
+              };
+            }).pipe(
+              Effect.ensuring(
+                Effect.gen(function* () {
+                  // One prompt per turn, so this settles unconditionally.
+                  // Cleared even when the turn never started — a model switch can
+                  // fail after `activeTurnId` is installed, and leaving it set
+                  // advertises a turn to `listSessions` and the reaper that no
+                  // longer exists. Only the event below depends on having started.
+                  if (ctx.activeTurnId === turnId) {
+                    ctx.activeTurnId = undefined;
+                  }
+                  // Read from shared state rather than this call's local flag: the
+                  // prompt that published `turn.started` may not be the one that
+                  // settles the turn, and the settler still owes the completion.
+                  const published = ctx.publishedTurnIds.has(turnId);
+                  ctx.publishedTurnIds.delete(turnId);
+                  ctx.reservedTurnIds.delete(turnId);
+                  // The public session field is what `listSessions` and the reaper
+                  // read, so leaving it set would advertise a turn that has ended.
+                  if (ctx.session.activeTurnId === turnId) {
+                    const { activeTurnId: _endedTurnId, ...endedSession } = ctx.session;
+                    ctx.session = { ...endedSession, status: "ready", updatedAt: yield* nowIso };
+                  }
+                  // A prompt that failed or was interrupted after `turn.started`
+                  // still owes consumers a terminal event; without one the turn
+                  // renders as running forever even though sendTurn already
+                  // returned an error.
+                  if (!published) {
+                    return;
+                  }
+                  const state =
+                    stopReason === "cancelled"
+                      ? "cancelled"
+                      : promptSucceeded
+                        ? "completed"
+                        : "failed";
+                  yield* offerRuntimeEvent({
+                    type: "turn.completed",
+                    ...(yield* makeEventStamp()),
+                    provider: PROVIDER,
+                    threadId: input.threadId,
+                    turnId,
+                    payload: { state, stopReason },
+                  });
+                  // `catchCause` rather than `catch`: a defect while stamping or
+                  // publishing would otherwise escape after the turn's prompt count
+                  // was already decremented, stranding the turn as running.
+                }).pipe(Effect.catchCause(() => Effect.void)),
+              ),
+            );
+          }),
         );
       });
 
