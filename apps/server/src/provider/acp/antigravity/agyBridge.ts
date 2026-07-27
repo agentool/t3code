@@ -64,6 +64,12 @@ const KILL_ESCALATION_MS = 5_000;
 /** Secret shared with hook processes so a decision cannot be forged. */
 const HOOK_SECRET_ENV = "T3_AGY_HOOK_SECRET";
 const HOOK_POLL_INTERVAL_MS = 50;
+/**
+ * Drains a transcript record waits for the hook that would announce its tool
+ * call. Twenty polls is a second — long enough for a hook that is merely late,
+ * short enough that a step no hook will ever cover does not stall the stream.
+ */
+const MAX_DEFERRED_DRAINS = 20;
 const DEFAULT_PRINT_TIMEOUT = "2h";
 const HOOKS_KEY = "t3code-antigravity-observer";
 
@@ -1278,19 +1284,36 @@ function drain(input: {
     }
     // Records held from an earlier pass go first: their hook may have arrived
     // since, and they are older than anything read just now.
-    const held = input.state.deferredRecords.splice(0, input.state.deferredRecords.length);
+    const carried = input.state.deferredRecords.splice(0, input.state.deferredRecords.length);
     const records = [
-      ...held,
+      ...carried,
       ...allLines.map((line) => parseTranscriptLine(line)).filter((r) => r !== null),
     ];
-    for (const record of records) {
+    if (carried.length === 0) {
+      input.state.deferredDrains = 0;
+    }
+    // A deferral is a barrier, not a skip: everything after it is held too.
+    // Emitting later records while an earlier one waits would put a tool's
+    // output after text that followed it, and replay it out of order next pass.
+    //
+    // Bounded, because Antigravity emits steps for its own internal work that
+    // no hook ever announces. Past the limit the held records are released in
+    // order and any still unmatched are dropped, so an unhookable step costs
+    // its own output rather than stalling everything behind it.
+    const held = input.state.deferredRecords;
+    const releasing = input.final || input.state.deferredDrains >= MAX_DEFERRED_DRAINS;
+    for (let index = 0; index < records.length; index += 1) {
+      const record = records[index];
+      if (record === undefined) {
+        continue;
+      }
       const result = transcriptRecordUpdates(record, input.state);
+      if (result.deferred && !releasing) {
+        held.push(...records.slice(index).filter((entry) => entry !== undefined));
+        input.state.deferredDrains += 1;
+        break;
+      }
       if (result.deferred) {
-        // Its tool call has not been announced yet. On the final pass nothing
-        // more is coming, so holding it would only lose it silently.
-        if (!input.final) {
-          input.state.deferredRecords.push(record);
-        }
         continue;
       }
       for (const update of result.updates) {

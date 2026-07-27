@@ -222,6 +222,12 @@ export interface AgyTurnState {
    * rather than dropped and retried on the next pass.
    */
   readonly deferredRecords: Array<AgyTranscriptRecordLike>;
+  /**
+   * Drains the held records have waited. Antigravity emits unpaired steps for
+   * its own internal work, so a record whose hook is never coming must not
+   * block the stream indefinitely.
+   */
+  deferredDrains: number;
   conversationId: string | undefined;
   transcriptPath: string | undefined;
   /** Transcript file pinned for the turn; see `resolveTranscriptPath`. */
@@ -245,6 +251,7 @@ export function makeAgyTurnState(conversationId?: string): AgyTurnState {
     pendingTerminal: new Map(),
     transcriptSeenSteps: new Set(),
     deferredRecords: [],
+    deferredDrains: 0,
     conversationId,
     transcriptPath: undefined,
     resolvedTranscriptPath: undefined,
