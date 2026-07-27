@@ -65,12 +65,14 @@ Known constraints, all inherent to print mode:
 - `--model` is a per-spawn flag that composes with `--conversation`, so a model switch keeps
   the trajectory and applies from the next turn (`sessionModelSwitch: "in-session"`).
 - Cancelling a turn kills `agy`'s whole process group, not just `agy`: tools it started
-  otherwise keep writing to the workspace after Stop. The group is owned from spawn and
-  reaped when the leader exits, which is the last moment the group id is certainly still
-  ours — a delayed signal to a bare group id can land on whatever the OS recycled it onto.
-  On Windows there are no process groups; `taskkill /T` covers the tree while the leader
-  lives, but a tool that outlives its leader there cannot be reaped without a Job Object,
-  which needs a native addon.
+  otherwise keep writing to the workspace after Stop. Every signal is guarded on the leader
+  still being alive, because a group id belongs to us only while it holds one — once the
+  leader is reaped the number is free, and a signal sent afterwards can land on whatever
+  inherited it. Nothing signals a group after its `exit`.
+  The cost is that a tool which deliberately outlives `agy` is not reaped. That is the same
+  boundary the approval gate draws: code the user has already approved can do as it likes,
+  including backgrounding itself. Reaping those would need a supervisor process that stays
+  in the group, or a Windows Job Object — neither reachable in plain Node.
 - Any `agy` subcommand spawned for a probe must set `stdin: "ignore"`. `agy` starts a language
   server and will not emit output while stdin stays open, so the default `"pipe"` hangs it.
 

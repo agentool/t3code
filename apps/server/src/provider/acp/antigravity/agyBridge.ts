@@ -961,66 +961,59 @@ let activeChild: NodeChildProcess.ChildProcess | null = null;
  * output can still arrive against a turn that has been reported cancelled.
  */
 /**
- * Groups signalled but not yet confirmed dead, keyed by the child that owns
- * them so a pending escalation can be cancelled and never runs twice.
- *
- * A group id is only safe to signal while a member is alive: once the group is
- * empty the OS may reuse the number, and a delayed SIGKILL would land on
- * whatever inherited it.
+ * Children whose group has been signalled, so a fence and the cancel behind it
+ * do not arm two backstops for the same process.
  */
 const pendingKills = new Map<
   NodeChildProcess.ChildProcess,
   { readonly pid: number; timer?: ReturnType<typeof setTimeout> }
 >();
 
+/**
+ * Signal a child's process group — but only while the child is alive.
+ *
+ * A group id is safe to use only while the leader still holds it. Once the
+ * leader has been reaped the number is free for reuse, and a signal sent then
+ * can land on whatever inherited it. Every call site is therefore guarded on
+ * the leader being alive, and nothing signals a group after its `exit` event.
+ *
+ * The cost is that a tool which deliberately outlives `agy` is not reaped. That
+ * is the same boundary the approval gate draws: code the user has already
+ * approved can do what it likes, including backgrounding itself.
+ */
 function signalGroupOf(
   child: NodeChildProcess.ChildProcess,
   pid: number,
   signal: NodeJS.Signals,
 ): void {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+  if (process.platform === "win32") {
+    // No process groups; this walks the tree while the leader still anchors it.
+    try {
+      NodeChildProcess.execFileSync("taskkill", ["/pid", String(pid), "/T", "/F"], {
+        stdio: "ignore",
+      });
+    } catch {
+      try {
+        child.kill(signal);
+      } catch {
+        // Nothing left to signal.
+      }
+    }
+    return;
+  }
   try {
     // Negative pid targets the group, which `detached: true` gave the child.
     process.kill(-pid, signal);
   } catch {
-    // Already gone, or never got a group; fall back to the child alone.
     try {
       child.kill(signal);
     } catch {
       // Nothing left to signal.
     }
   }
-}
-
-/**
- * Take ownership of a freshly spawned child's process group.
- *
- * Attached at spawn, not when cancelling. Registering it later loses the race
- * where the leader has already exited — the handler would never fire, and the
- * timed backstop skips a leader it can see is gone — leaving anything the
- * leader started alive with nothing tracking it.
- *
- * The group is killed when the leader exits, whatever the reason. A turn's
- * tools have no business outliving the turn, and this is the last moment the
- * group id is certainly still ours.
- */
-function ownChildGroup(child: NodeChildProcess.ChildProcess, pid: number): void {
-  child.once("exit", () => {
-    if (process.platform === "win32") {
-      // Best effort only: once the leader pid is gone `taskkill /T` has no tree
-      // left to walk. Reliably reaping survivors here needs a Job Object, which
-      // is not reachable without a native addon.
-      try {
-        NodeChildProcess.execFileSync("taskkill", ["/pid", String(pid), "/T", "/F"], {
-          stdio: "ignore",
-        });
-      } catch {
-        // Nothing left, or nothing we can do.
-      }
-    } else {
-      signalGroupOf(child, pid, "SIGKILL");
-    }
-    clearPendingKill(child);
-  });
 }
 
 function clearPendingKill(child: NodeChildProcess.ChildProcess): void {
@@ -1031,7 +1024,14 @@ function clearPendingKill(child: NodeChildProcess.ChildProcess): void {
   pendingKills.delete(child);
 }
 
-/** SIGKILL every group still awaiting escalation. Used on shutdown. */
+/** Release tracking when a child ends, so nothing signals it afterwards. */
+function forgetChildOnExit(child: NodeChildProcess.ChildProcess): void {
+  child.once("exit", () => {
+    clearPendingKill(child);
+  });
+}
+
+/** Kill every group still being tracked. Used on shutdown. */
 function killPendingGroups(): void {
   for (const [child, pending] of pendingKills) {
     signalGroupOf(child, pending.pid, "SIGKILL");
@@ -1431,9 +1431,9 @@ async function runTurn(
   activeTurnToken = turnToken;
   activeChild = child;
   if (child.pid !== undefined) {
-    // Owned from the moment it exists, so nothing it spawns can outlive it
-    // unnoticed.
-    ownChildGroup(child, child.pid);
+    // Tracking is released the moment it ends, so nothing ever signals a group
+    // id that is no longer ours.
+    forgetChildOnExit(child);
   }
   // A cancel during startup had no process to signal; deliver it now.
   if (cancelledSessions.has(sessionId)) {
