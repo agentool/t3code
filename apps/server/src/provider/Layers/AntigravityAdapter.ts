@@ -605,6 +605,17 @@ export function makeAntigravityAdapter(
             // Held outside the workflow so the finalizer can clear the entry
             // wherever inside it things stopped.
             let registeredRequestId: ApprovalRequestId | undefined;
+            // Set once the UI has been told a request exists. From then on it
+            // is owed a terminal event: the tool is denied either way, but a
+            // request left open cannot be answered or dismissed.
+            let opened:
+              | {
+                  readonly requestId: ApprovalRequestId;
+                  readonly permissionRequest: ReturnType<typeof parsePermissionRequest>;
+                  readonly turnId: TurnId | undefined;
+                }
+              | undefined;
+            let resolutionPublished = false;
             return mapAcpCallbackFailure(
               Effect.gen(function* () {
                 // Bound to the turn actually running, with the epoch that turn
@@ -661,6 +672,7 @@ export function makeAntigravityAdapter(
                     rawPayload: params,
                   }),
                 );
+                opened = { requestId, permissionRequest, turnId: approvalTurnId };
                 // Raced against a deadline and cleaned up unconditionally: the
                 // bridge forgets its side of a timed-out request, so without
                 // this the handler would stay blocked and the entry retained.
@@ -683,6 +695,7 @@ export function makeAntigravityAdapter(
                     decision: resolved,
                   }),
                 );
+                resolutionPublished = true;
                 // Re-checked at the moment of answering: an approval decided
                 // while Stop was landing must not come back as an allow.
                 const stillLive =
@@ -703,11 +716,34 @@ export function makeAntigravityAdapter(
                 // would otherwise leave the entry in the map for good, and the
                 // request open in the UI with nothing able to answer it.
                 Effect.ensuring(
-                  Effect.sync(() => {
-                    if (registeredRequestId !== undefined) {
-                      pendingApprovals.delete(registeredRequestId);
-                    }
-                  }),
+                  Effect.uninterruptible(
+                    Effect.gen(function* () {
+                      // A request the UI has seen but never got a resolution
+                      // for would sit there permanently, unanswerable. The tool
+                      // is denied regardless; this closes the request out.
+                      if (opened !== undefined && !resolutionPublished) {
+                        const closing = opened;
+                        yield* Effect.ignore(
+                          Effect.gen(function* () {
+                            yield* offerRuntimeEvent(
+                              makeAcpRequestResolvedEvent({
+                                stamp: yield* makeEventStamp(),
+                                provider: PROVIDER,
+                                threadId: input.threadId,
+                                turnId: closing.turnId,
+                                requestId: RuntimeRequestId.make(closing.requestId),
+                                permissionRequest: closing.permissionRequest,
+                                decision: "cancel",
+                              }),
+                            );
+                          }),
+                        );
+                      }
+                      if (registeredRequestId !== undefined) {
+                        pendingApprovals.delete(registeredRequestId);
+                      }
+                    }),
+                  ),
                 ),
               ),
             );

@@ -374,11 +374,28 @@ function readHookEvents(hookDir: string, seen: Set<string>): ReadonlyArray<Obser
       const raw = NodeFS.readFileSync(NodePath.join(hookDir, name), "utf8");
       const parsed: unknown = JSON.parse(raw);
       if (typeof parsed === "object" && parsed !== null) {
-        // Digested from the bytes on disk, which is what the hook itself
-        // hashed; a file swapped in between changes this and the hook rejects
-        // the decision rather than acting on a request nobody approved.
-        hookPayloadDigests.set(name, digestPayload((parsed as AgyHookEvent).rawPayload ?? ""));
-        events.push({ name, event: parsed as AgyHookEvent });
+        const record = parsed as AgyHookEvent;
+        // The signed digest and the payload shown to the user must come from
+        // the same bytes. Taking the outer `payload` for display while signing
+        // `rawPayload` would let an attacker rewrite only the outer copy: the
+        // user approves harmless-looking arguments, the hook's digest still
+        // matches its untouched stdin, and the original request runs.
+        const raw = record.rawPayload;
+        if (typeof raw !== "string") {
+          continue;
+        }
+        let payload: AgyHookPayload;
+        try {
+          const reparsed: unknown = JSON.parse(raw);
+          if (typeof reparsed !== "object" || reparsed === null) {
+            continue;
+          }
+          payload = reparsed as AgyHookPayload;
+        } catch {
+          continue;
+        }
+        hookPayloadDigests.set(name, digestPayload(raw));
+        events.push({ name, event: { ...record, payload } });
       }
     } catch {
       // A half-written hook file is picked up on the next poll.
@@ -924,7 +941,7 @@ let activeChild: NodeChildProcess.ChildProcess | null = null;
  * mid-write keeps changing the workspace after the user pressed Stop, and its
  * output can still arrive against a turn that has been reported cancelled.
  */
-function killActiveChild(): void {
+function killActiveChild(options?: { readonly immediate?: boolean }): void {
   const child = activeChild;
   if (!child?.pid) {
     return;
@@ -958,6 +975,10 @@ function killActiveChild(): void {
       }
     }
   };
+  if (options?.immediate) {
+    signalGroup("SIGKILL");
+    return;
+  }
   signalGroup("SIGTERM");
   // Escalation does not depend on the leader still being alive. `agy` can exit
   // on SIGTERM while a tool it started ignores the signal and keeps the group —
@@ -1378,6 +1399,9 @@ async function runTurn(
   // now resolves to a denial rather than writing into a vanishing directory or
   // banking a blanket approval for the next turn.
   turnToken.live = false;
+  // Scoped to the turn: every hook of every turn would otherwise stay in here
+  // for the life of the bridge.
+  hookPayloadDigests.clear();
   activeTurnEpoch = undefined;
   activeTurnToken = undefined;
   cleanupDir(hookDir);
@@ -1610,9 +1634,12 @@ export async function runAgyBridge(): Promise<void> {
   // otherwise. Losing the bridge — a signal, a crashing parent — would
   // otherwise leave `agy` and its tools running against the user's workspace
   // with nothing left to stop them.
+  // Shutdown kills outright rather than scheduling an escalation: `process.exit`
+  // runs no timers, so a graceful SIGTERM here would leave a tool that ignores
+  // it alive in its own detached group with the bridge already gone.
   const stopChildOnExit = () => {
     shuttingDown = true;
-    killActiveChild();
+    killActiveChild({ immediate: true });
   };
   process.once("SIGTERM", () => {
     stopChildOnExit();
