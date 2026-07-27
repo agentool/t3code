@@ -282,6 +282,14 @@ export function makeAntigravityAdapter(
       options?.nativeEventLogger === undefined ? nativeEventLogger : undefined;
     const makeAcpNativeLoggers = yield* makeAcpNativeLoggerFactory();
 
+    // Scope for work that must outlive the session it concerns — specifically
+    // the cancel-acknowledgement fallback, whose whole job is to tear that
+    // session down. Forked into the session's own scope it would be closing the
+    // scope it runs in, and a scope waits for its children: the close would
+    // wait on the fiber waiting on the close.
+    const adapterScope = yield* Scope.make("sequential");
+    yield* Effect.addFinalizer(() => Effect.ignore(Scope.close(adapterScope, Exit.void)));
+
     const sessions = new Map<ThreadId, AntigravitySessionContext>();
     /**
      * Approvals awaiting a user decision, per thread. Held outside the session
@@ -928,12 +936,18 @@ export function makeAntigravityAdapter(
                     );
                     return;
                 }
-              }),
+              }).pipe(
+                // Per event, not around the whole stream. Catching outside the
+                // drain meant one unprocessable notification ended the consumer
+                // for good: every later event was lost, and the turn events
+                // that depend on it stopped being attributed even though
+                // prompts kept completing.
+                Effect.catchCause((cause) =>
+                  Effect.logError("Failed to process Antigravity runtime notification.", { cause }),
+                ),
+              ),
             ),
           ).pipe(
-            Effect.catch((cause) =>
-              Effect.logError("Failed to process Antigravity runtime notification.", { cause }),
-            ),
             // However this consumer ends — teardown, a defect while stamping,
             // an interrupt — it fires the same signal drains wait on. Without
             // it a consumer that died on its own would leave every later drain
@@ -1428,7 +1442,7 @@ export function makeAntigravityAdapter(
                 ),
               ),
             ),
-            ctx.scope,
+            adapterScope,
           );
         }
       });

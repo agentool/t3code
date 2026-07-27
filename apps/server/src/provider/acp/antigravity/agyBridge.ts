@@ -70,6 +70,12 @@ const HOOK_POLL_INTERVAL_MS = 50;
  * short enough that a step no hook will ever cover does not stall the stream.
  */
 const MAX_DEFERRED_DRAINS = 20;
+/**
+ * Cap on the `agy` output held in memory per stream. Only the tail is kept:
+ * stdout is a fallback used when the transcript streamed nothing, and stderr
+ * only needs to explain a failure.
+ */
+const MAX_CAPTURED_OUTPUT = 256 * 1024;
 const DEFAULT_PRINT_TIMEOUT = "2h";
 const HOOKS_KEY = "t3code-antigravity-observer";
 
@@ -1471,15 +1477,26 @@ async function runTurn(
     killActiveChild();
   }
 
+  // Both are kept as bounded tails. A turn that prints a large file — or a tool
+  // that loops — would otherwise grow these strings for the whole run and take
+  // the bridge's heap with it, turning a noisy turn into a dead provider.
+  // stdout is only ever a fallback for when the transcript produced nothing,
+  // and stderr only has to carry enough to explain a failure.
   let stdout = "";
   let stderr = "";
+  const appendBounded = (current: string, chunk: string): string => {
+    const combined = current + chunk;
+    return combined.length <= MAX_CAPTURED_OUTPUT
+      ? combined
+      : combined.slice(combined.length - MAX_CAPTURED_OUTPUT);
+  };
   child.stdout?.setEncoding("utf8");
   child.stdout?.on("data", (chunk: string) => {
-    stdout += chunk;
+    stdout = appendBounded(stdout, chunk);
   });
   child.stderr?.setEncoding("utf8");
   child.stderr?.on("data", (chunk: string) => {
-    stderr += chunk;
+    stderr = appendBounded(stderr, chunk);
   });
 
   const poller = setInterval(() => {
@@ -1751,6 +1768,16 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
         // higher epoch and must survive this notification, which the runtime
         // forks and can therefore deliver late.
         //
+        // A cancel is authoritative for the turn that is running: the fence
+        // that would normally have raised the mark is a separate notification
+        // and can fail to send, and without this the child would survive a Stop
+        // the client believes it delivered.
+        if (activeTurnEpoch !== undefined) {
+          cancelledThroughEpoch.set(
+            sessionId,
+            Math.max(cancelledThrough(sessionId), activeTurnEpoch),
+          );
+        }
         // Judged by the running turn's own mode, not by anything the session
         // did earlier. A turn whose prompt carried no epoch cannot be scoped by
         // a mark it never contributed to, so it takes plain ACP semantics; one
