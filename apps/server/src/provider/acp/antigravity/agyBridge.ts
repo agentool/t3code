@@ -107,29 +107,27 @@ function transcriptDirFor(conversationId: string): string {
  * output as live. Returns 0 when the file cannot be measured, which falls back
  * to the marker heuristic rather than skipping the turn's own output.
  */
-function transcriptBaseline(conversationId: string | undefined): number {
+function transcriptBaseline(
+  conversationId: string | undefined,
+): { readonly path: string; readonly size: number } | undefined {
   if (!conversationId) {
-    return 0;
+    return undefined;
   }
-  // Measured against the same file `resolveTranscriptPath` will pin, and the
-  // path is remembered so the two cannot disagree. A byte offset taken from
-  // `transcript_full.jsonl` means nothing in the condensed file: if it exceeded
-  // that file's size the turn would read nothing at all.
+  // Path and size come from one measurement and are used together. Deciding
+  // the file twice would let the condensed transcript appear between the two
+  // and apply an offset taken from `transcript_full.jsonl` to a different
+  // file — which, if it exceeded that file's size, reads nothing at all.
   const dir = transcriptDirFor(conversationId);
   const condensed = NodePath.join(dir, "transcript.jsonl");
   const full = NodePath.join(dir, "transcript_full.jsonl");
-  const target = NodeFS.existsSync(condensed) ? condensed : full;
-  try {
-    return NodeFS.statSync(target).size;
-  } catch {
-    return 0;
+  for (const path of [condensed, full]) {
+    try {
+      return { path, size: NodeFS.statSync(path).size };
+    } catch {
+      // Try the sibling, then report nothing measurable.
+    }
   }
-}
-
-function baselineTranscriptPath(conversationId: string): string {
-  const dir = transcriptDirFor(conversationId);
-  const condensed = NodePath.join(dir, "transcript.jsonl");
-  return NodeFS.existsSync(condensed) ? condensed : NodePath.join(dir, "transcript_full.jsonl");
+  return undefined;
 }
 
 function stateDirPath(): string {
@@ -1030,13 +1028,13 @@ async function runTurn(
   const seenHooks = new Set<string>();
   const cursor = new AgyTranscriptCursor();
   const decoder = new NodeStringDecoder.StringDecoder("utf8");
-  const transcriptOffset = { value: baseline };
-  if (baseline > 0 && session.conversationId) {
+  const transcriptOffset = { value: baseline?.size ?? 0 };
+  if (baseline && baseline.size > 0) {
     // Reading starts past every earlier turn, so there is no prior-turn
-    // content left for the `USER_INPUT` heuristic to guess at. The path is
-    // pinned to the file the baseline was measured from.
+    // content left for the `USER_INPUT` heuristic to guess at. The turn is
+    // pinned to the exact file the baseline was measured from.
     state.transcriptPrimed = true;
-    state.resolvedTranscriptPath = baselineTranscriptPath(session.conversationId);
+    state.resolvedTranscriptPath = baseline.path;
   }
   const assistantText = { emitted: false };
   activeChild = child;

@@ -793,7 +793,17 @@ export function makeAntigravityAdapter(
           // Claimed from shared state, not from "am I a steer": the prompt this
           // one folded into may have failed before it announced anything, and
           // emitting content for a turn that never started strands the UI.
-          if (!ctx.startedTurnIds.has(turnId)) {
+          //
+          // Test and claim are one synchronous step — publishing first and
+          // marking afterwards let two concurrent steers both find the turn
+          // unannounced and emit `turn.started` twice. The claim is released
+          // again if publication does not happen, so a turn nobody saw start
+          // cannot later be completed.
+          const announcing = !ctx.startedTurnIds.has(turnId);
+          if (announcing) {
+            ctx.startedTurnIds.add(turnId);
+          }
+          if (announcing) {
             yield* offerRuntimeEvent({
               type: "turn.started",
               ...(yield* makeEventStamp()),
@@ -801,11 +811,13 @@ export function makeAntigravityAdapter(
               threadId: input.threadId,
               turnId,
               payload: { model: ctx.session.model },
-            });
-            // Marked only after the event is actually out, so a failed publish
-            // cannot let another prompt emit a completion for a turn nobody
-            // saw start.
-            ctx.startedTurnIds.add(turnId);
+            }).pipe(
+              Effect.onExit((exit) =>
+                Exit.isSuccess(exit)
+                  ? Effect.void
+                  : Effect.sync(() => ctx.startedTurnIds.delete(turnId)),
+              ),
+            );
           }
 
           const result = yield* ctx.promptGate
