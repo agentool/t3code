@@ -180,6 +180,15 @@ interface AntigravitySessionContext {
   /** Cancel epoch the active turn belongs to; steering is scoped to it. */
   activeTurnEpoch: number;
   /**
+   * Turn whose prompt currently owns the submission gate.
+   *
+   * Streamed events belong to whichever turn the bridge is actually running,
+   * which is not always the newest: after a Stop a fresh turn can be announced
+   * while the cancelled turn's final updates are still being consumed, and
+   * attributing those to the newcomer files one turn's output under another.
+   */
+  submittingTurnId: TurnId | undefined;
+  /**
    * Number of prompts in flight. >0 means a turn is running, so a new
    * sendTurn steers the existing turn rather than opening a new one.
    */
@@ -708,6 +717,7 @@ export function makeAntigravityAdapter(
             approvals: pendingApprovals,
             acpSessionId: started.sessionId,
             activeTurnEpoch: -1,
+            submittingTurnId: undefined,
             promptsInFlightByTurn: new Map(),
             stopped: false,
           };
@@ -728,7 +738,7 @@ export function makeAntigravityAdapter(
                         stamp: yield* makeEventStamp(),
                         provider: PROVIDER,
                         threadId: ctx.threadId,
-                        turnId: ctx.activeTurnId,
+                        turnId: ctx.submittingTurnId ?? ctx.activeTurnId,
                         itemId: event.itemId,
                         lifecycle: "item.started",
                       }),
@@ -740,7 +750,7 @@ export function makeAntigravityAdapter(
                         stamp: yield* makeEventStamp(),
                         provider: PROVIDER,
                         threadId: ctx.threadId,
-                        turnId: ctx.activeTurnId,
+                        turnId: ctx.submittingTurnId ?? ctx.activeTurnId,
                         itemId: event.itemId,
                         lifecycle: "item.completed",
                       }),
@@ -753,7 +763,7 @@ export function makeAntigravityAdapter(
                         stamp: yield* makeEventStamp(),
                         provider: PROVIDER,
                         threadId: ctx.threadId,
-                        turnId: ctx.activeTurnId,
+                        turnId: ctx.submittingTurnId ?? ctx.activeTurnId,
                         payload: event.payload,
                         source: "acp.jsonrpc",
                         method: "session/update",
@@ -768,7 +778,7 @@ export function makeAntigravityAdapter(
                         stamp: yield* makeEventStamp(),
                         provider: PROVIDER,
                         threadId: ctx.threadId,
-                        turnId: ctx.activeTurnId,
+                        turnId: ctx.submittingTurnId ?? ctx.activeTurnId,
                         toolCall: event.toolCall,
                         rawPayload: event.rawPayload,
                       }),
@@ -781,7 +791,7 @@ export function makeAntigravityAdapter(
                         stamp: yield* makeEventStamp(),
                         provider: PROVIDER,
                         threadId: ctx.threadId,
-                        turnId: ctx.activeTurnId,
+                        turnId: ctx.submittingTurnId ?? ctx.activeTurnId,
                         ...(event.itemId ? { itemId: event.itemId } : {}),
                         text: event.text,
                         rawPayload: event.rawPayload,
@@ -1046,6 +1056,10 @@ export function makeAntigravityAdapter(
                 if (ctx.cancelEpoch !== acceptedEpoch || ctx.stopped) {
                   return undefined;
                 }
+                // Owned from here until after the drain below, so this turn's
+                // streamed events stay attributed to it even once a newer turn
+                // has been announced.
+                ctx.submittingTurnId = turnId;
                 // The bridge writes its `session/update` notifications before
                 // the prompt response, but the runtime only queues them.
                 // Draining inside the gate keeps the turn from settling — and
@@ -1071,6 +1085,15 @@ export function makeAntigravityAdapter(
                   .pipe(
                     Effect.tapCause(() => drain),
                     Effect.tap(() => drain),
+                    // Released only after the drain, so events this turn queued
+                    // are still attributed to it.
+                    Effect.ensuring(
+                      Effect.sync(() => {
+                        if (ctx.submittingTurnId === turnId) {
+                          ctx.submittingTurnId = undefined;
+                        }
+                      }),
+                    ),
                   );
               }),
             )

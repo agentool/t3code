@@ -842,9 +842,23 @@ const cancelledSessions = new Set<string>();
  * single high-water mark per session cannot lose one and cannot grow.
  */
 const cancelledThroughEpoch = new Map<string, number>();
+/**
+ * Sessions whose next queued prompt has been cancelled without an epoch.
+ *
+ * Only for clients that do not send fences: without an epoch there is nothing
+ * to compare a queued prompt against, so a plain `session/cancel` for a
+ * session whose turn has not started yet would be dropped and its prompt would
+ * run afterwards. Consumed by the next prompt for that session.
+ */
+const unscopedCancels = new Set<string>();
 
 function cancelledThrough(sessionId: string): number {
   return cancelledThroughEpoch.get(sessionId) ?? -1;
+}
+
+/** Whether this session's client uses the epoch extension. */
+function usesEpochs(sessionId: string): boolean {
+  return cancelledThroughEpoch.has(sessionId);
 }
 
 /** The adapter's cancel epoch for a submission, carried in `_meta.t3.epoch`. */
@@ -1334,7 +1348,12 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
       // so there is no mark it could be measured against — refusing it would
       // reject every prompt such a client ever sends once a mark exists.
       const promptEpoch = promptEpochOf(params);
-      if (promptEpoch !== undefined && promptEpoch <= cancelledThrough(sessionId)) {
+      // One-shot, and only reachable for a client that sends no epochs.
+      const unscopedCancelled = promptEpoch === undefined && unscopedCancels.delete(sessionId);
+      if (
+        unscopedCancelled ||
+        (promptEpoch !== undefined && promptEpoch <= cancelledThrough(sessionId))
+      ) {
         // Cancelled before it could start; never spawn `agy` for it.
         sendResult(id, { stopReason: "cancelled" });
         return;
@@ -1380,15 +1399,30 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
     }
     case "session/cancel": {
       const sessionId = typeof params["sessionId"] === "string" ? params["sessionId"] : undefined;
+      if (sessionId && sessions.has(sessionId) && sessionId !== activeTurnSessionId) {
+        // No turn running for it yet. A fencing client has already raised the
+        // mark, so its queued prompt is covered; one that does not fence needs
+        // this marker or its queued prompt would start after the cancel.
+        if (!usesEpochs(sessionId)) {
+          unscopedCancels.add(sessionId);
+        }
+        return;
+      }
       if (sessionId && sessions.has(sessionId) && sessionId === activeTurnSessionId) {
         // Only the turn actually running is stopped, and only when its epoch
         // has been cancelled. A prompt accepted after the fence carries a
         // higher epoch and must survive this notification, which the runtime
         // forks and can therefore deliver late.
         //
-        // An untagged turn has no epoch to scope by, so it is cancelled
-        // outright — that is the plain ACP behaviour its client expects.
-        if (activeTurnEpoch === undefined || activeTurnEpoch <= cancelledThrough(sessionId)) {
+        // An untagged turn is cancelled outright — plain ACP behaviour — but
+        // only when this session's client never fences. In a session that does,
+        // a delayed cancel belonging to an already-fenced turn would otherwise
+        // kill an untagged follow-up that started in the meantime.
+        const unscoped = activeTurnEpoch === undefined && !usesEpochs(sessionId);
+        if (
+          unscoped ||
+          (activeTurnEpoch !== undefined && activeTurnEpoch <= cancelledThrough(sessionId))
+        ) {
           cancelledSessions.add(sessionId);
           activeChild?.kill("SIGTERM");
         }
