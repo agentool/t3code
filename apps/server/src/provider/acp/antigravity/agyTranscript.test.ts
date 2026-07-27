@@ -298,6 +298,22 @@ describe("AgyTranscriptCursor", () => {
     expect(cursor.carryLength).toBe('{"a":1}'.length + 1 + '{"b":2}'.length + 1);
   });
 
+  it("drops an aggregate retained suffix that exceeds its budget", () => {
+    const cursor = new AgyTranscriptCursor();
+
+    expect(cursor.retainWithinLimit(["1234", "5678"], 9)).toBe(false);
+    expect(cursor.carryLength).toBe(0);
+    expect(cursor.push('{"current":true}\n')).toEqual(['{"current":true}']);
+  });
+
+  it("counts a partial record when bounding a retained suffix", () => {
+    const cursor = new AgyTranscriptCursor();
+    cursor.push("partial");
+
+    expect(cursor.retainWithinLimit(["12"], 9)).toBe(false);
+    expect(cursor.push(' tail\n{"current":true}\n')).toEqual(['{"current":true}']);
+  });
+
   it("keeps counting consumed bytes across an abandoned record", () => {
     // The offset is what the next read starts from, so dropping content must
     // not desynchronise it from the file.

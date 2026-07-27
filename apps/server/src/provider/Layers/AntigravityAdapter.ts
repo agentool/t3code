@@ -731,6 +731,25 @@ export function makeAntigravityAdapter(
                   pendingApprovals.delete(requestId);
                   return { outcome: { outcome: "cancelled" } as const };
                 }
+                // The bridge sends the tool update before asking permission,
+                // but the ACP runtime only queues that update. Wait until the
+                // notification consumer has published everything ahead of this
+                // barrier so the request cannot overtake the tool call it
+                // belongs to. Teardown wins the race when that consumer is no
+                // longer available, which keeps a stopped session from holding
+                // the hook callback forever.
+                const eventStreamDrained = yield* Effect.raceFirst(
+                  ctx.acp.drainEvents.pipe(Effect.as(true)),
+                  Deferred.await(ctx.teardownSignal).pipe(Effect.as(false)),
+                );
+                if (
+                  !eventStreamDrained ||
+                  ctx.stopped ||
+                  (approvalEpoch !== undefined && approvalEpoch !== ctx.cancelEpoch)
+                ) {
+                  pendingApprovals.delete(requestId);
+                  return { outcome: { outcome: "cancelled" } as const };
+                }
                 // Built first, then published and recorded in one uninterruptible
                 // step. An interrupt between the two would leave the UI showing
                 // a request the finalizer does not know to close.
@@ -1464,11 +1483,18 @@ export function makeAntigravityAdapter(
         // Uninterruptible as a whole. The epoch moves first, so an interrupt
         // partway would leave prompts refused against a fence the bridge never
         // received — `agy` running on after Stop with nothing left to tell it.
-        yield* Effect.uninterruptible(cancelSequence(ctx, threadId));
+        yield* Effect.uninterruptible(cancelSequence(ctx));
       });
 
-    const cancelSequence = (ctx: AntigravitySessionContext, threadId: ThreadId) =>
+    const cancelSequence = (ctx: AntigravitySessionContext) =>
       Effect.gen(function* () {
+        // `requireSession` yields its context to the caller, so a concurrent
+        // restart can replace it before this effect begins. A stale interrupt
+        // must not cancel either the old process or approvals owned by the new
+        // session now registered for the same thread.
+        if (sessions.get(ctx.threadId) !== ctx) {
+          return;
+        }
         // Recorded before anything else: prompts already accepted but still
         // queued upstream compare against this and refuse to submit.
         // Read and bumped in one synchronous step: everything accepted up to
@@ -1484,11 +1510,8 @@ export function makeAntigravityAdapter(
         // permission request has a hook process blocked behind it, and the
         // bridge turns "cancel" into a denial. Leaving it pending would hold
         // that tool until the hook's own timeout.
-        const pending = approvalsByThread.get(threadId);
-        if (pending) {
-          for (const [, approval] of pending) {
-            yield* Effect.ignore(Deferred.succeed(approval.decision, "cancel"));
-          }
+        for (const [, approval] of ctx.approvals) {
+          yield* Effect.ignore(Deferred.succeed(approval.decision, "cancel"));
         }
         // The fence names the epoch being cancelled through, rather than one
         // notification per outstanding prompt. Everything accepted at or below

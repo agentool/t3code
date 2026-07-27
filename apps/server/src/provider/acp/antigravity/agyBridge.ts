@@ -1346,7 +1346,12 @@ function drain(input: {
     if (!input.state.transcriptPrimed && allLines.length > 0) {
       const trimmed = dropPriorTurnRecords(allLines);
       const foundBoundary = trimmed.length !== allLines.length;
-      input.state.transcriptBoundarySeen = input.state.transcriptBoundarySeen || foundBoundary;
+      if (foundBoundary) {
+        // A boundary observed after an overflow makes its suffix eligible
+        // again: everything retained from here belongs after that input, while
+        // text discarded before it remains permanently excluded.
+        input.state.transcriptPrimingOverflowed = false;
+      }
       if (input.state.resumedConversation && !input.final && moreTranscript) {
         // Still short of the end of the file, so no `USER_INPUT` seen so far can
         // be trusted to be this turn's: the current turn's opening record may
@@ -1356,21 +1361,22 @@ function drain(input: {
         // What is held back is `trimmed`, not the whole batch — history is
         // discarded as it is scanned, which is both what the turn wants and
         // what keeps the hold bounded to a single turn's output.
-        const heldChars =
-          input.cursor.carryLength + trimmed.reduce((total, line) => total + line.length + 1, 0);
-        if (!input.state.transcriptBoundarySeen && heldChars > MAX_TRANSCRIPT_LINE_CHARS) {
-          // No boundary anywhere in a budget's worth of scanning. Give up on
-          // what was scanned, including the partial record at the read cutoff:
-          // this turn loses whatever preceded this point, which is the right
-          // way to be wrong. Priming while unread bytes remain would replay
-          // another turn's output as this one's.
-          input.cursor.discardThroughNextNewline();
-        } else {
-          input.cursor.retain(trimmed);
+        if (
+          !input.state.transcriptPrimingOverflowed &&
+          !input.cursor.retainWithinLimit(trimmed, MAX_TRANSCRIPT_LINE_CHARS)
+        ) {
+          // Give up on what was scanned, including the partial record at the
+          // read cutoff. Priming while unread bytes remain would replay another
+          // turn's output as this one's, and retaining again before a later
+          // boundary would merely rebuild the discarded historical suffix.
+          input.state.transcriptPrimingOverflowed = true;
         }
         allLines = [];
       } else {
-        allLines = [...trimmed];
+        // Overflow discarded an unknown part of the candidate turn. Without a
+        // later input boundary, the remaining tail is just as likely to be old
+        // history and must not be surfaced as current-turn output.
+        allLines = input.state.transcriptPrimingOverflowed ? [] : [...trimmed];
         input.state.transcriptPrimed = true;
       }
     }

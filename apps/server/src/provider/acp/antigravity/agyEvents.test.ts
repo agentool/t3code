@@ -255,6 +255,18 @@ describe("orderAgySessionUpdates", () => {
       ]),
     ).toEqual([update("step 2"), update("unindexed PLANNER_RESPONSE"), update("step 3")]);
   });
+
+  it("keeps an unindexed response after the terminal update it followed", () => {
+    const update = (name: string) => ({ name });
+
+    expect(
+      orderAgySessionUpdates([
+        { stepIdx: 2, phase: "transcript", update: update("tool output") },
+        { stepIdx: 2, phase: "terminal", update: update("tool complete") },
+        { stepIdx: undefined, phase: "transcript", update: update("assistant after tool") },
+      ]),
+    ).toEqual([update("tool output"), update("tool complete"), update("assistant after tool")]);
+  });
 });
 
 describe("approvalOutcomeToDecision", () => {

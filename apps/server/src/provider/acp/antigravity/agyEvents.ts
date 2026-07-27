@@ -245,11 +245,11 @@ export interface AgyTurnState {
    */
   transcriptPrimed: boolean;
   /**
-   * Whether priming has crossed a `USER_INPUT` record. The marker itself is
-   * removed from the retained suffix, so later capped reads cannot rediscover
-   * it and must remember that the suffix already follows a boundary.
+   * Whether resumed-transcript priming discarded its candidate suffix after
+   * exceeding the memory budget. Records that follow can still be history, so
+   * none are emitted until a later `USER_INPUT` establishes a new boundary.
    */
-  transcriptBoundarySeen: boolean;
+  transcriptPrimingOverflowed: boolean;
   /**
    * Whether this turn resumed an existing conversation. Only then can the
    * transcript already hold other turns' records at byte 0.
@@ -269,7 +269,7 @@ export function makeAgyTurnState(conversationId?: string): AgyTurnState {
     transcriptPath: undefined,
     resolvedTranscriptPath: undefined,
     transcriptPrimed: false,
-    transcriptBoundarySeen: false,
+    transcriptPrimingOverflowed: false,
     resumedConversation: conversationId !== undefined,
     modelName: undefined,
   };
@@ -302,17 +302,25 @@ export function orderAgySessionUpdates(
   entries: ReadonlyArray<AgyOrderedSessionUpdate>,
 ): ReadonlyArray<AgySessionUpdate> {
   const phaseOrder = { pre: 0, transcript: 1, terminal: 2 } as const;
-  let precedingStep = Number.NEGATIVE_INFINITY;
+  let precedingKey: { readonly step: number; readonly phase: number } | undefined;
   return entries
     .map((entry) => {
-      // PLANNER_RESPONSE records may omit step_index. Giving one the preceding
-      // key lets the stable sort leave it where the transcript reader put it,
-      // between that step and the next, instead of moving it to the batch end.
-      precedingStep = entry.stepIdx ?? precedingStep;
-      return { entry, step: precedingStep };
+      // PLANNER_RESPONSE records may omit step_index. Reusing the preceding
+      // entry's complete ordering key lets the stable sort keep the response
+      // immediately after that entry, including when it followed a terminal
+      // update, while indexed entries still use step and lifecycle phase.
+      const key =
+        entry.stepIdx === undefined
+          ? (precedingKey ?? {
+              step: Number.NEGATIVE_INFINITY,
+              phase: phaseOrder[entry.phase],
+            })
+          : { step: entry.stepIdx, phase: phaseOrder[entry.phase] };
+      precedingKey = key;
+      return { entry, key };
     })
     .sort((left, right) => {
-      return left.step - right.step || phaseOrder[left.entry.phase] - phaseOrder[right.entry.phase];
+      return left.key.step - right.key.step || left.key.phase - right.key.phase;
     })
     .map(({ entry }) => entry.update);
 }

@@ -291,6 +291,25 @@ export class AgyTranscriptCursor {
   }
 
   /**
+   * Retain a candidate suffix only while all held transcript text fits within
+   * the caller's budget.
+   *
+   * Resumed conversations are scanned from byte zero when no baseline was
+   * measurable. Dropping the whole candidate on overflow prevents an
+   * append-only history from accumulating in memory while the caller searches
+   * for the current turn's final `USER_INPUT` boundary.
+   */
+  retainWithinLimit(lines: ReadonlyArray<string>, maxChars: number): boolean {
+    const lineChars = lines.reduce((total, line) => total + line.length + 1, 0);
+    if (this.carryLength + lineChars > maxChars) {
+      this.discardThroughNextNewline();
+      return false;
+    }
+    this.retain(lines);
+    return true;
+  }
+
+  /**
    * Abandon everything scanned so far and resume after the current record.
    *
    * A capped read can stop inside a record. Clearing only the completed lines
