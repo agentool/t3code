@@ -1179,6 +1179,11 @@ export function makeAntigravityAdapter(
         // Read and bumped in one synchronous step: everything accepted up to
         // and including this value is what the fence below covers.
         const cancelledThrough = ctx.cancelEpoch;
+        // Captured in the same synchronous step as the epoch, before anything
+        // yields. Reading it later would name whichever turn happened to be
+        // active by then — the cancelled one can finish and a new one acquire
+        // the gate while approvals are settled and notifications are written.
+        const cancelledTurnId = ctx.activeTurnId;
         ctx.cancelEpoch += 1;
         // Settled before the cancel goes out, as ACP requires: an outstanding
         // permission request has a hook process blocked behind it, and the
@@ -1217,7 +1222,6 @@ export function makeAntigravityAdapter(
         // turn — and the bridge would ignore the accompanying cancel, its
         // epoch being newer than this fence, leaving `agy` running while T3
         // believed the turn was cancelled.
-        const cancelledTurnId = ctx.activeTurnId;
         if (cancelledTurnId !== undefined) {
           yield* Effect.forkIn(
             Effect.sleep(CANCEL_ACK_TIMEOUT_MS).pipe(
