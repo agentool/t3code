@@ -89,11 +89,6 @@ const PROVIDER = ProviderDriverKind.make("antigravity");
  * unanswered request pinning its entry and its UI prompt forever.
  */
 const APPROVAL_WAIT_MS = 11 * 60 * 1000;
-/**
- * Cap on waiting for queued ACP events to be consumed before a turn settles.
- * Only an ordering nicety, so it must never outlive a torn-down consumer.
- */
-const EVENT_DRAIN_TIMEOUT_MS = 5_000;
 const ANTIGRAVITY_RESUME_VERSION = 1 as const;
 
 export interface AntigravityAdapterLiveOptions {
@@ -156,6 +151,29 @@ interface AntigravitySessionContext {
    * separate from the thread lock, which teardown needs to stay free.
    */
   readonly promptGate: Semaphore.Semaphore;
+  /**
+   * Serializes the turn-lifecycle critical sections against teardown.
+   *
+   * Announcing a turn is "check the session is live, reserve the turn, publish
+   * the start" and teardown is "mark stopped, snapshot what was published".
+   * Interleaving those two is what let a start be published after
+   * `session.exited`, or a turn be completed while its start was still being
+   * stamped. Both run under this, and both are short and yield-free apart from
+   * the publications they own.
+   */
+  readonly lifecycleGate: Semaphore.Semaphore;
+  /**
+   * Fired the moment teardown begins. Waiting on the event consumer races
+   * against this rather than a wall clock, so a slow but healthy consumer is
+   * still awaited in full while a torn-down one never blocks anybody.
+   */
+  readonly teardownSignal: Deferred.Deferred<void>;
+  /**
+   * This session's pending approvals. Held on the context as well as in
+   * `approvalsByThread` so teardown can tell its own map from a replacement
+   * session's before clearing the registry entry.
+   */
+  readonly approvals: Map<ApprovalRequestId, PendingApproval>;
   /**
    * Number of prompts in flight. >0 means a turn is running, so a new
    * sendTurn steers the existing turn rather than opening a new one.
@@ -329,81 +347,101 @@ export function makeAntigravityAdapter(
       return Effect.succeed(ctx);
     };
 
+    /**
+     * Idempotent, uninterruptible teardown of everything a context owns.
+     *
+     * Shared by the normal stop path and its failure path so neither can leave
+     * half of it done: `ctx.stopped` is set before any of this runs, so a stop
+     * that died partway would otherwise make every later attempt return
+     * immediately with the bridge and its `agy` child still alive.
+     */
+    const cleanupContext = (ctx: AntigravitySessionContext) =>
+      Effect.uninterruptible(
+        Effect.gen(function* () {
+          if (ctx.notificationFiber) {
+            yield* Effect.ignore(Fiber.interrupt(ctx.notificationFiber));
+            ctx.notificationFiber = undefined;
+          }
+          yield* Effect.ignore(Scope.close(ctx.scope, Exit.void));
+          // Ownership-checked: a replacement session may already have been
+          // installed while this teardown was closing a slow child, and
+          // clearing its entries would leak that session's process.
+          if (sessions.get(ctx.threadId) === ctx) {
+            sessions.delete(ctx.threadId);
+          }
+          if (approvalsByThread.get(ctx.threadId) === ctx.approvals) {
+            approvalsByThread.delete(ctx.threadId);
+          }
+        }),
+      );
+
     const stopSessionInternal = (ctx: AntigravitySessionContext) =>
       Effect.gen(function* () {
-        if (ctx.stopped) return;
-        ctx.stopped = true;
+        // Claiming the stop, snapshotting what was published, and clearing the
+        // active turn happen under the lifecycle gate so they cannot interleave
+        // with a `sendTurn` that is midway through announcing its turn.
+        const orphanedTurnIds = yield* ctx.lifecycleGate.withPermit(
+          Effect.sync(() => {
+            if (ctx.stopped) {
+              return undefined;
+            }
+            ctx.stopped = true;
+            const claimed = [...ctx.publishedTurnIds];
+            ctx.publishedTurnIds.clear();
+            ctx.reservedTurnIds.clear();
+            ctx.activeTurnId = undefined;
+            return claimed;
+          }),
+        );
+        if (orphanedTurnIds === undefined) {
+          return;
+        }
+        // Releases anything waiting on the event consumer before that consumer
+        // is torn down.
+        yield* Effect.ignore(Deferred.succeed(ctx.teardownSignal, undefined));
+
         // Anything still waiting on a human is cancelled, which the bridge
         // turns into a denial. Left pending, the hook would block its tool
         // until its own timeout with no one able to answer.
-        const pending = approvalsByThread.get(ctx.threadId);
-        if (pending) {
-          for (const [, approval] of pending) {
-            // Ignored: an answer racing session stop may have settled this
-            // already, and that must not abort the rest of teardown.
-            yield* Effect.ignore(Deferred.succeed(approval.decision, "cancel"));
-          }
-          approvalsByThread.delete(ctx.threadId);
+        for (const [, approval] of ctx.approvals) {
+          // Ignored: an answer racing session stop may have settled this
+          // already, and that must not abort the rest of teardown.
+          yield* Effect.ignore(Deferred.succeed(approval.decision, "cancel"));
         }
-        // Claimed here, so a `sendTurn` finalizer waking later finds nothing
-        // left to settle and stays silent. Otherwise closing the scope wakes
-        // `acp.prompt` on another fiber and its completion lands after
-        // `session.exited` — or on whatever session replaced this one.
-        const orphanedTurnIds = [...ctx.publishedTurnIds];
-        ctx.publishedTurnIds.clear();
-        ctx.reservedTurnIds.clear();
+        ctx.approvals.clear();
+
+        // Quiesced before any terminal event is published: updates already
+        // queued for the consumer would otherwise surface after the completion
+        // that is supposed to close them out.
+        yield* cleanupContext(ctx);
+
         for (const orphanedTurnId of orphanedTurnIds) {
-          yield* offerRuntimeEvent({
-            type: "turn.completed",
-            ...(yield* makeEventStamp()),
-            provider: PROVIDER,
-            threadId: ctx.threadId,
-            turnId: orphanedTurnId,
-            payload: { state: "cancelled", stopReason: null },
-          });
-        }
-        ctx.activeTurnId = undefined;
-        // Uninterruptible, and after the events above rather than gated on
-        // them: `ctx.stopped` is already true, so a failure or interrupt while
-        // publishing would make every later stop attempt return immediately
-        // and leave the bridge and its `agy` child running for good.
-        yield* Effect.uninterruptible(
-          Effect.gen(function* () {
-            if (ctx.notificationFiber) {
-              yield* Effect.ignore(Fiber.interrupt(ctx.notificationFiber));
-            }
-            yield* Effect.ignore(Scope.close(ctx.scope, Exit.void));
-            // Only if this context still owns the slot: a replacement session
-            // may already have been installed while this teardown was closing
-            // a slow child, and deleting it would leak that one's process.
-            if (sessions.get(ctx.threadId) === ctx) {
-              sessions.delete(ctx.threadId);
-            }
-          }),
-        );
-        yield* Effect.ignore(
-          offerRuntimeEvent({
-            type: "session.exited",
-            ...(yield* makeEventStamp()),
-            provider: PROVIDER,
-            threadId: ctx.threadId,
-            payload: { exitKind: "graceful" },
-          }),
-        );
-      }).pipe(
-        // Publication of the shutdown events above is best effort; the process
-        // and registry cleanup underneath it is not optional.
-        Effect.onExit(() =>
-          Effect.uninterruptible(
-            Effect.gen(function* () {
-              yield* Effect.ignore(Scope.close(ctx.scope, Exit.void));
-              if (sessions.get(ctx.threadId) === ctx) {
-                sessions.delete(ctx.threadId);
-              }
+          yield* Effect.ignore(
+            offerRuntimeEvent({
+              type: "turn.completed",
+              ...(yield* makeEventStamp()),
+              provider: PROVIDER,
+              threadId: ctx.threadId,
+              turnId: orphanedTurnId,
+              payload: { state: "cancelled", stopReason: null },
             }),
-          ),
-        ),
-      );
+          );
+        }
+        // Suppressed when a replacement already holds this thread: the event
+        // names the thread, not the context, so it would read as the new
+        // session exiting.
+        if (sessions.get(ctx.threadId) === undefined) {
+          yield* Effect.ignore(
+            offerRuntimeEvent({
+              type: "session.exited",
+              ...(yield* makeEventStamp()),
+              provider: PROVIDER,
+              threadId: ctx.threadId,
+              payload: { exitKind: "graceful" },
+            }),
+          );
+        }
+      }).pipe(Effect.onExit(() => cleanupContext(ctx)));
 
     const startSession: AntigravityAdapterShape["startSession"] = (input) =>
       withThreadLock(
@@ -612,6 +650,9 @@ export function makeAntigravityAdapter(
             reservedTurnIds: new Set(),
             publishedTurnIds: new Set(),
             promptGate: yield* Semaphore.make(1),
+            lifecycleGate: yield* Semaphore.make(1),
+            teardownSignal: yield* Deferred.make<void>(),
+            approvals: pendingApprovals,
             promptsInFlight: 0,
             stopped: false,
           };
@@ -870,34 +911,51 @@ export function makeAntigravityAdapter(
           // unannounced and emit `turn.started` twice. The claim is released
           // again if publication does not happen, so a turn nobody saw start
           // cannot later be completed.
-          const announcing = !ctx.reservedTurnIds.has(turnId);
-          if (announcing) {
-            ctx.reservedTurnIds.add(turnId);
-          }
+          // Reservation is taken under the lifecycle gate so teardown cannot
+          // snapshot between the check and the claim.
+          const announcing = yield* ctx.lifecycleGate.withPermit(
+            Effect.sync(() => {
+              if (ctx.stopped || ctx.reservedTurnIds.has(turnId)) {
+                return false;
+              }
+              ctx.reservedTurnIds.add(turnId);
+              return true;
+            }),
+          );
           if (announcing) {
             // Stamp generation sits inside the guarded region: it can fail or
             // be interrupted too, and a claim left behind without its event
             // would make a steer skip the start and let settlement publish an
             // orphan completion.
-            yield* Effect.gen(function* () {
-              yield* offerRuntimeEvent({
-                type: "turn.started",
-                ...(yield* makeEventStamp()),
-                provider: PROVIDER,
-                threadId: input.threadId,
-                turnId,
-                payload: { model: ctx.session.model },
-              });
-              // Marked published only once the event is genuinely out, so
-              // teardown never completes a turn that was merely reserved.
-              ctx.publishedTurnIds.add(turnId);
-            }).pipe(
-              Effect.onExit((exit) =>
-                Exit.isSuccess(exit)
-                  ? Effect.void
-                  : Effect.sync(() => ctx.reservedTurnIds.delete(turnId)),
-              ),
-            );
+            yield* ctx.lifecycleGate
+              .withPermit(
+                Effect.gen(function* () {
+                  // Re-checked inside the gate: teardown may have run while
+                  // this fiber waited for it, and a start published after
+                  // `session.exited` is worse than no start at all.
+                  if (ctx.stopped) {
+                    return;
+                  }
+                  yield* offerRuntimeEvent({
+                    type: "turn.started",
+                    ...(yield* makeEventStamp()),
+                    provider: PROVIDER,
+                    threadId: input.threadId,
+                    turnId,
+                    payload: { model: ctx.session.model },
+                  });
+                  // Marked published only once the event is genuinely out, so
+                  // teardown never completes a turn that was merely reserved.
+                  ctx.publishedTurnIds.add(turnId);
+                }),
+              )
+              .pipe(
+                Effect.onExit((exit) =>
+                  Exit.isSuccess(exit)
+                    ? Effect.void
+                    : Effect.sync(() => ctx.reservedTurnIds.delete(turnId)),
+                ),
+              );
           }
 
           const result = yield* ctx.promptGate
@@ -922,8 +980,12 @@ export function makeAntigravityAdapter(
                 // Losing the ordering guarantee is recoverable; a permanent
                 // hang is not. The error path drains too — a nonzero `agy`
                 // exit still emits final updates before its response.
+                // Raced against teardown rather than a wall clock: a slow but
+                // healthy consumer is still awaited in full, while a consumer
+                // that stop has interrupted can never strand this fiber
+                // holding the gate.
                 const drain = Effect.ignore(
-                  Effect.timeoutOption(ctx.acp.drainEvents, EVENT_DRAIN_TIMEOUT_MS),
+                  Effect.raceFirst(ctx.acp.drainEvents, Deferred.await(ctx.teardownSignal)),
                 );
                 return yield* ctx.acp.prompt({ prompt: promptParts }).pipe(
                   Effect.tapCause(() => drain),
@@ -1128,11 +1190,16 @@ export function makeAntigravityAdapter(
 
     // Snapshotted, not iterated live: teardown deletes from this map, and a
     // concurrent `startSession` can install a replacement mid-sweep.
+    // Each teardown runs under the thread lock, so a sweep cannot interleave
+    // with a `startSession` installing a replacement for the same thread.
+    const stopSwept = (ctx: AntigravitySessionContext) =>
+      withThreadLock(ctx.threadId, stopSessionInternal(ctx));
+
     const stopAll: AntigravityAdapterShape["stopAll"] = () =>
-      Effect.forEach(Array.from(sessions.values()), stopSessionInternal, { discard: true });
+      Effect.forEach(Array.from(sessions.values()), stopSwept, { discard: true });
 
     yield* Effect.addFinalizer(() =>
-      Effect.forEach(Array.from(sessions.values()), stopSessionInternal, { discard: true }).pipe(
+      Effect.forEach(Array.from(sessions.values()), stopSwept, { discard: true }).pipe(
         Effect.catch((cause) =>
           Effect.logError("Failed to emit Antigravity session shutdown event.", { cause }),
         ),
