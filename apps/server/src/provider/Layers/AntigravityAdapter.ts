@@ -177,6 +177,14 @@ interface AntigravitySessionContext {
   /** Bridge-side session id, needed to address provider-specific notifications. */
   readonly acpSessionId: string;
   /**
+   * Ids of prompts accepted but not yet answered by the bridge. An interrupt
+   * fences exactly these, so a cancel can never stop a prompt submitted after
+   * it — which every session-scoped variant of this did.
+   */
+  readonly outstandingPromptIds: Set<string>;
+  /** Counter behind `outstandingPromptIds`; unique within this session. */
+  nextPromptSeq: number;
+  /**
    * Number of prompts in flight. >0 means a turn is running, so a new
    * sendTurn steers the existing turn rather than opening a new one.
    */
@@ -343,8 +351,13 @@ export function makeAntigravityAdapter(
       });
 
     const withThreadLock = <A, E, R>(threadId: string, effect: Effect.Effect<A, E, R>) =>
-      Effect.flatMap(getThreadSemaphore(threadId), (lock) =>
-        lock.semaphore.withPermit(effect).pipe(Effect.ensuring(releaseThreadSemaphore(threadId))),
+      // Bracketed: an interrupt landing between taking the holder count and
+      // registering its release would retain that thread's entry for good,
+      // which is the leak the counting is there to prevent.
+      Effect.acquireUseRelease(
+        getThreadSemaphore(threadId),
+        (lock) => lock.semaphore.withPermit(effect),
+        () => releaseThreadSemaphore(threadId),
       );
 
     const logNative = (threadId: ThreadId, method: string, payload: unknown) =>
@@ -687,6 +700,8 @@ export function makeAntigravityAdapter(
             teardownSignal: yield* Deferred.make<void>(),
             approvals: pendingApprovals,
             acpSessionId: started.sessionId,
+            outstandingPromptIds: new Set(),
+            nextPromptSeq: 0,
             promptsInFlight: 0,
             stopped: false,
           };
@@ -780,7 +795,12 @@ export function makeAntigravityAdapter(
             // queuing a barrier nobody can acknowledge, hanging `sendTurn`
             // while it holds the prompt gate.
             Effect.onExit(() => Effect.ignore(Deferred.succeed(ctx.teardownSignal, undefined))),
-            Effect.forkChild,
+            // Forked into the session's own scope, not the calling fiber's.
+            // `startSession` can run inside a short-lived request fiber, and a
+            // child fork would die with it while the session and its bridge
+            // live on — taking every future event with it, and now also
+            // tripping the signal above so drains stop waiting.
+            Effect.forkIn(sessionScope),
           );
 
           ctx.notificationFiber = nf;
@@ -830,6 +850,14 @@ export function makeAntigravityAdapter(
     const sendTurn: AntigravityAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(input.threadId);
+        // Claimed before any yielding preparation. Attachment resolution and id
+        // generation both yield, and a Stop landing in that window would
+        // otherwise find nothing outstanding to fence — the prompt would then
+        // reach `agy` carrying the post-cancel state and pass every check.
+        ctx.nextPromptSeq += 1;
+        const promptId = `${ctx.acpSessionId}-${ctx.nextPromptSeq}`;
+        const acceptedEpoch = ctx.cancelEpoch;
+        ctx.outstandingPromptIds.add(promptId);
 
         // `agy --print` takes a single text prompt, so attachments travel as
         // `resource_link` blocks (ACP baseline, no capability needed) pointing
@@ -889,7 +917,6 @@ export function makeAntigravityAdapter(
         const freshTurnId = TurnId.make(yield* randomUUIDv4);
         const steeringTurnId = ctx.promptsInFlight > 0 ? ctx.activeTurnId : undefined;
         const turnId = steeringTurnId ?? freshTurnId;
-        const acceptedEpoch = ctx.cancelEpoch;
         // Claimed together, without an intervening yield: assigning the active
         // turn id later let a concurrent call see `promptsInFlight > 0` with no
         // id yet and open a rival turn.
@@ -1027,10 +1054,12 @@ export function makeAntigravityAdapter(
                 const drain = Effect.ignore(
                   Effect.raceFirst(ctx.acp.drainEvents, Deferred.await(ctx.teardownSignal)),
                 );
-                return yield* ctx.acp.prompt({ prompt: promptParts }).pipe(
-                  Effect.tapCause(() => drain),
-                  Effect.tap(() => drain),
-                );
+                return yield* ctx.acp
+                  .prompt({ prompt: promptParts, _meta: { t3: { promptId } } })
+                  .pipe(
+                    Effect.tapCause(() => drain),
+                    Effect.tap(() => drain),
+                  );
               }),
             )
             .pipe(
@@ -1070,6 +1099,9 @@ export function makeAntigravityAdapter(
         }).pipe(
           Effect.ensuring(
             Effect.gen(function* () {
+              // No longer in transit, whatever happened to it: a fence for this
+              // id would now stop nothing, and keeping it would grow the set.
+              ctx.outstandingPromptIds.delete(promptId);
               // Decrement and the last-prompt test are one synchronous step, so
               // a steer arriving mid-settlement cannot make two prompts both
               // believe they own the turn and publish a terminal event each.
@@ -1145,8 +1177,8 @@ export function makeAntigravityAdapter(
         // lets the bridge recognise and stop that one. Sending it
         // unconditionally would instead fence a cancel that arrived after its
         // own turn ended, killing the next unrelated prompt.
-        if (ctx.promptsInFlight > 0) {
-          yield* Effect.ignore(ctx.acp.notify("t3/fence", { sessionId: ctx.acpSessionId }));
+        for (const outstanding of ctx.outstandingPromptIds) {
+          yield* Effect.ignore(ctx.acp.notify("t3/fence", { promptId: outstanding }));
         }
         yield* Effect.ignore(
           ctx.acp.cancel.pipe(

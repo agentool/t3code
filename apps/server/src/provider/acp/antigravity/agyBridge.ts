@@ -841,20 +841,29 @@ const cancelledSessions = new Set<string>();
  */
 const cancelGenerations = new Map<string, number>();
 /**
- * Sessions with a prompt the client has cancelled but which has not arrived.
+ * Ids of individual prompts the client cancelled before they arrived.
  *
  * The generation check compares a prompt's enqueue-time value against its
  * run-time value, which cannot see a cancel that landed *before* the prompt
  * arrived — the prompt simply reads the post-cancel value and matches, and the
  * runtime forks its cancel notification, so that ordering is real.
  *
- * Set only by the explicit `t3/fence` notification, which the adapter sends —
- * and awaits — before cancelling, and only when it actually has a prompt
- * outstanding. Inferring it from "no turn is running" instead would fence a
- * cancel that merely arrived after its own turn finished, killing the next
- * unrelated prompt.
+ * Keyed by prompt, not by session: every session-scoped variant of this ends
+ * up cancelling some later, unrelated prompt, because "a cancel happened and
+ * no turn is running" also describes a cancel that merely arrived after its
+ * own turn finished. The adapter stamps each submission with an id and names
+ * that exact id when it fences, so a fence can only ever stop the prompt it
+ * was meant for.
  */
-const pendingCancelMarkers = new Set<string>();
+const fencedPromptIds = new Set<string>();
+
+/** The adapter's per-submission id, carried in `_meta.t3.promptId`. */
+function promptIdOf(params: Record<string, unknown>): string | undefined {
+  const meta = params["_meta"];
+  const t3 = isRecord(meta) ? meta["t3"] : undefined;
+  const promptId = isRecord(t3) ? t3["promptId"] : undefined;
+  return typeof promptId === "string" && promptId.length > 0 ? promptId : undefined;
+}
 /** Cancel generation captured when each queued prompt was accepted, by JSON-RPC id. */
 const queuedPromptGenerations = new Map<unknown, number>();
 
@@ -1061,9 +1070,7 @@ async function runTurn(
 ): Promise<TurnOutcome> {
   // A cancel that raced the end of an earlier turn must not decide this one.
   cancelledSessions.delete(sessionId);
-  // This turn was allowed to start, so no in-transit cancel is outstanding for
-  // it; leaving the marker would stop an unrelated later prompt.
-  pendingCancelMarkers.delete(sessionId);
+
   // Claimed before any setup work: spawning `agy` takes long enough that a
   // cancel can land first, and cancels are only honoured for the session
   // holding this claim. Leaving it unset until after the spawn would silently
@@ -1324,9 +1331,10 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
         sendError(id, -32602, "unknown sessionId");
         return;
       }
-      // Consumed here, so exactly one prompt is stopped by a cancel that
-      // outran it; anything the user sends afterwards runs normally.
-      const cancelledInTransit = pendingCancelMarkers.delete(sessionId);
+      // Consumed by id, so a fence can only stop the prompt it named; anything
+      // the user sends afterwards runs normally.
+      const promptId = promptIdOf(params);
+      const cancelledInTransit = promptId !== undefined && fencedPromptIds.delete(promptId);
       if (
         cancelledInTransit ||
         (queuedAt !== undefined && queuedAt !== cancelGeneration(sessionId))
@@ -1351,9 +1359,9 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
     // Sent by the adapter immediately before it cancels, and only while it has
     // a prompt outstanding. Notifications carry no id, so nothing is replied.
     case "t3/fence": {
-      const sessionId = typeof params["sessionId"] === "string" ? params["sessionId"] : undefined;
-      if (sessionId && sessions.has(sessionId)) {
-        pendingCancelMarkers.add(sessionId);
+      const promptId = typeof params["promptId"] === "string" ? params["promptId"] : undefined;
+      if (promptId) {
+        fencedPromptIds.add(promptId);
       }
       return;
     }
@@ -1418,6 +1426,14 @@ export async function runAgyBridge(): Promise<void> {
       // id but no method, and must never enter the request queue — the turn
       // holding that queue is exactly what is waiting on the answer.
       if (message["method"] === undefined && resolveOutbound(message)) {
+        continue;
+      }
+
+      // Handled out of band alongside cancel. Queued, it would sit behind the
+      // very prompt it is meant to stop and only be recorded once that prompt
+      // had already run.
+      if (message["method"] === "t3/fence") {
+        void handleRequest(message);
         continue;
       }
 
