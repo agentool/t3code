@@ -133,6 +133,17 @@ interface AntigravitySessionContext {
    */
   readonly startedTurnIds: Set<TurnId>;
   /**
+   * Serializes prompt submission for this thread.
+   *
+   * `acp.prompt` already queues internally on its own semaphore, but that one
+   * is acquired inside the call where nothing can be rechecked — a steer could
+   * clear the cancel check, wait there, and reach the agent after Stop. Taking
+   * the same serialization here instead makes the wait observable, so the
+   * epoch can be re-read at the point submission actually begins. Deliberately
+   * separate from the thread lock, which teardown needs to stay free.
+   */
+  readonly promptGate: Semaphore.Semaphore;
+  /**
    * Number of prompts in flight. >0 means a turn is running, so a new
    * sendTurn steers the existing turn rather than opening a new one.
    */
@@ -529,6 +540,7 @@ export function makeAntigravityAdapter(
             currentModelId: boundModel,
             cancelEpoch: 0,
             startedTurnIds: new Set(),
+            promptGate: yield* Semaphore.make(1),
             promptsInFlight: 0,
             stopped: false,
           };
@@ -627,27 +639,37 @@ export function makeAntigravityAdapter(
           approvalsByThread.set(input.threadId, pendingApprovals);
           sessionScopeTransferred = true;
 
-          yield* offerRuntimeEvent({
-            type: "session.started",
-            ...(yield* makeEventStamp()),
-            provider: PROVIDER,
-            threadId: input.threadId,
-            payload: { resume: started.initializeResult },
-          });
-          yield* offerRuntimeEvent({
-            type: "session.state.changed",
-            ...(yield* makeEventStamp()),
-            provider: PROVIDER,
-            threadId: input.threadId,
-            payload: { state: "ready", reason: "Antigravity ACP session ready" },
-          });
-          yield* offerRuntimeEvent({
-            type: "thread.started",
-            ...(yield* makeEventStamp()),
-            provider: PROVIDER,
-            threadId: input.threadId,
-            payload: { providerThreadId: started.sessionId },
-          });
+          // Past this point the scoped finalizer no longer owns the scope, so
+          // a failure or interrupt while announcing the session would strand
+          // the bridge process, its notification fiber, and both registry
+          // entries with nothing left to close them. Ownership has moved to
+          // the session, so teardown has to move with it.
+          yield* Effect.onError(
+            Effect.gen(function* () {
+              yield* offerRuntimeEvent({
+                type: "session.started",
+                ...(yield* makeEventStamp()),
+                provider: PROVIDER,
+                threadId: input.threadId,
+                payload: { resume: started.initializeResult },
+              });
+              yield* offerRuntimeEvent({
+                type: "session.state.changed",
+                ...(yield* makeEventStamp()),
+                provider: PROVIDER,
+                threadId: input.threadId,
+                payload: { state: "ready", reason: "Antigravity ACP session ready" },
+              });
+              yield* offerRuntimeEvent({
+                type: "thread.started",
+                ...(yield* makeEventStamp()),
+                provider: PROVIDER,
+                threadId: input.threadId,
+                payload: { providerThreadId: started.sessionId },
+              });
+            }),
+            () => Effect.ignore(stopSessionInternal(ctx)),
+          );
 
           return session;
         }).pipe(Effect.scoped),
@@ -755,6 +777,19 @@ export function makeAntigravityAdapter(
             ctx.session = { ...ctx.session, model: turnModelSelection?.model ?? ctx.session.model };
           }
 
+          // Rechecked before anything is announced: everything above yields, so
+          // the session can be stopped or the turn interrupted while
+          // attachments resolve and the model is selected. Announcing a turn
+          // on a closed runtime would emit events after `session.exited`.
+          if (ctx.cancelEpoch !== acceptedEpoch || ctx.stopped) {
+            stopReason = "cancelled";
+            return {
+              threadId: input.threadId,
+              turnId,
+              resumeCursor: ctx.session.resumeCursor,
+            };
+          }
+
           // Claimed from shared state, not from "am I a steer": the prompt this
           // one folded into may have failed before it announced anything, and
           // emitting content for a turn that never started strands the UI.
@@ -772,10 +807,25 @@ export function makeAntigravityAdapter(
             // saw start.
             ctx.startedTurnIds.add(turnId);
           }
-          // Rechecked here rather than only at accept time: everything above
-          // yields, and an interrupt during any of it means this prompt must
-          // not reach the agent.
-          if (ctx.cancelEpoch !== acceptedEpoch) {
+
+          const result = yield* ctx.promptGate
+            .withPermit(
+              Effect.gen(function* () {
+                // Re-read once submission actually begins. Waiting for the gate
+                // is exactly the window in which Stop can land, and a prompt that
+                // reached the bridge after a cancel would spawn `agy` anyway.
+                if (ctx.cancelEpoch !== acceptedEpoch || ctx.stopped) {
+                  return undefined;
+                }
+                return yield* ctx.acp.prompt({ prompt: promptParts });
+              }),
+            )
+            .pipe(
+              Effect.mapError((error) =>
+                mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
+              ),
+            );
+          if (result === undefined) {
             stopReason = "cancelled";
             return {
               threadId: input.threadId,
@@ -783,14 +833,6 @@ export function makeAntigravityAdapter(
               resumeCursor: ctx.session.resumeCursor,
             };
           }
-
-          const result = yield* ctx.acp
-            .prompt({ prompt: promptParts })
-            .pipe(
-              Effect.mapError((error) =>
-                mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
-              ),
-            );
 
           const turnRecord = ctx.turns.find((turn) => turn.id === turnId);
           if (turnRecord) {

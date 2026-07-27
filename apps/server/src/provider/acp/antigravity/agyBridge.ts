@@ -111,15 +111,25 @@ function transcriptBaseline(conversationId: string | undefined): number {
   if (!conversationId) {
     return 0;
   }
+  // Measured against the same file `resolveTranscriptPath` will pin, and the
+  // path is remembered so the two cannot disagree. A byte offset taken from
+  // `transcript_full.jsonl` means nothing in the condensed file: if it exceeded
+  // that file's size the turn would read nothing at all.
   const dir = transcriptDirFor(conversationId);
-  for (const name of ["transcript.jsonl", "transcript_full.jsonl"]) {
-    try {
-      return NodeFS.statSync(NodePath.join(dir, name)).size;
-    } catch {
-      // Try the sibling, then give up.
-    }
+  const condensed = NodePath.join(dir, "transcript.jsonl");
+  const full = NodePath.join(dir, "transcript_full.jsonl");
+  const target = NodeFS.existsSync(condensed) ? condensed : full;
+  try {
+    return NodeFS.statSync(target).size;
+  } catch {
+    return 0;
   }
-  return 0;
+}
+
+function baselineTranscriptPath(conversationId: string): string {
+  const dir = transcriptDirFor(conversationId);
+  const condensed = NodePath.join(dir, "transcript.jsonl");
+  return NodeFS.existsSync(condensed) ? condensed : NodePath.join(dir, "transcript_full.jsonl");
 }
 
 function stateDirPath(): string {
@@ -866,13 +876,17 @@ function drain(input: {
         try {
           const length = stats.size - input.transcriptOffset.value;
           const buffer = Buffer.alloc(length);
-          NodeFS.readSync(fd, buffer, 0, length, input.transcriptOffset.value);
+          // `readSync` may return fewer bytes than asked for. Decoding the
+          // whole buffer would feed the zero-filled tail through as content
+          // and skip the real bytes for good, so only what was actually read
+          // is consumed; the rest is picked up on the next poll.
+          const bytesRead = NodeFS.readSync(fd, buffer, 0, length, input.transcriptOffset.value);
           // Decoded through the turn's streaming decoder, not `toString`: a
           // write can land mid-multibyte-character, and decoding each slice
           // independently would replace the partial sequence with U+FFFD and
           // advance past it, silently corrupting non-ASCII output.
-          chunk = input.decoder.write(buffer);
-          input.transcriptOffset.value = stats.size;
+          chunk = bytesRead > 0 ? input.decoder.write(buffer.subarray(0, bytesRead)) : "";
+          input.transcriptOffset.value += bytesRead;
         } finally {
           NodeFS.closeSync(fd);
         }
@@ -1017,10 +1031,12 @@ async function runTurn(
   const cursor = new AgyTranscriptCursor();
   const decoder = new NodeStringDecoder.StringDecoder("utf8");
   const transcriptOffset = { value: baseline };
-  if (baseline > 0) {
+  if (baseline > 0 && session.conversationId) {
     // Reading starts past every earlier turn, so there is no prior-turn
-    // content left for the `USER_INPUT` heuristic to guess at.
+    // content left for the `USER_INPUT` heuristic to guess at. The path is
+    // pinned to the file the baseline was measured from.
     state.transcriptPrimed = true;
+    state.resolvedTranscriptPath = baselineTranscriptPath(session.conversationId);
   }
   const assistantText = { emitted: false };
   activeChild = child;
@@ -1330,6 +1346,10 @@ export async function runAgyBridge(): Promise<void> {
   // stdin closed: no approval can still be answered, so unblock the hooks
   // waiting on them (they fail closed) rather than letting them time out.
   failPendingOutbound("T3 Code disconnected before approving this tool call");
-  await queue;
+  // Killed before awaiting the queue, not after: an in-flight `session/prompt`
+  // only resolves when `agy` exits, so waiting first would keep the bridge and
+  // its child alive for the whole print timeout — hours — after the client
+  // disconnected.
   activeChild?.kill("SIGTERM");
+  await queue;
 }
