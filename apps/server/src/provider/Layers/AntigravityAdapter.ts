@@ -672,6 +672,10 @@ export function makeAntigravityAdapter(
             // Held outside the workflow so the finalizer can clear the entry
             // wherever inside it things stopped.
             let registeredRequestId: ApprovalRequestId | undefined;
+            // Held alongside the id so the finalizer can signal completion even
+            // after the entry has been removed from the registry by settlement
+            // or teardown.
+            let registeredApproval: PendingApproval | undefined;
             // Set once the UI has been told a request exists. From then on it
             // is owed a terminal event: the tool is denied either way, but a
             // request left open cannot be answered or dismissed.
@@ -710,8 +714,10 @@ export function makeAntigravityAdapter(
                 const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
                 const decision = yield* Deferred.make<ProviderApprovalDecision>();
                 const settled = yield* Deferred.make<void>();
-                pendingApprovals.set(requestId, { decision, turnId: approvalTurnId, settled });
+                const approval: PendingApproval = { decision, turnId: approvalTurnId, settled };
+                pendingApprovals.set(requestId, approval);
                 registeredRequestId = requestId;
+                registeredApproval = approval;
                 // Rechecked after registering, not only before: minting the id
                 // and the deferred both yield, and a Stop landing in that gap
                 // would find no entry to cancel — leaving this request open in
@@ -767,8 +773,13 @@ export function makeAntigravityAdapter(
                 // current again once the next one started, and this would
                 // answer "allow" for a tool whose token the bridge has already
                 // retired.
+                // A defined turn on both sides is required, not just equality:
+                // a request that arrived with no turn running compared
+                // `undefined === undefined` against a session whose turn had
+                // already been cleared, and passed.
                 const stillLive =
                   !ctx?.stopped &&
+                  approvalTurnId !== undefined &&
                   ctx?.activeTurnId === approvalTurnId &&
                   (approvalEpoch === undefined || ctx?.cancelEpoch === approvalEpoch);
                 const optionId =
@@ -834,15 +845,17 @@ export function makeAntigravityAdapter(
                         );
                       }
                       if (registeredRequestId !== undefined) {
-                        const registered = pendingApprovals.get(registeredRequestId);
                         pendingApprovals.delete(registeredRequestId);
-                        // Announces that this handler is done publishing. Turn
-                        // settlement cancels outstanding approvals and waits on
-                        // this, so `request.resolved` precedes `turn.completed`
-                        // instead of racing it.
-                        if (registered !== undefined) {
-                          yield* Effect.ignore(Deferred.succeed(registered.settled, undefined));
-                        }
+                      }
+                      // Completed from the entry captured at registration, not
+                      // from a fresh map lookup. Settlement and teardown both
+                      // remove entries before this finalizer runs, so looking it
+                      // up here found nothing and left every waiter to time out.
+                      // This handler owns the signal; the map is only a registry.
+                      if (registeredApproval !== undefined) {
+                        yield* Effect.ignore(
+                          Deferred.succeed(registeredApproval.settled, undefined),
+                        );
                       }
                     }),
                   ),
@@ -1356,18 +1369,26 @@ export function makeAntigravityAdapter(
                       // bound, because a handler that never finishes must not
                       // strand the turn — so `request.resolved` is published
                       // before the completion below.
-                      const orphanedApprovals = [...ctx.approvals.entries()].filter(
-                        ([, approval]) => approval.turnId === turnId,
+                      const orphanedApprovals = [...ctx.approvals.values()].filter(
+                        (approval) => approval.turnId === turnId,
                       );
-                      for (const [requestId, approval] of orphanedApprovals) {
+                      for (const approval of orphanedApprovals) {
                         yield* Effect.ignore(Deferred.succeed(approval.decision, "cancel"));
-                        ctx.approvals.delete(requestId);
                       }
-                      for (const [, approval] of orphanedApprovals) {
+                      // Entries are left in place: each handler removes its own
+                      // on the way out. Removing them here left the finalizers
+                      // with nothing to look up, so nothing ever signalled and
+                      // every wait below ran its deadline out in full.
+                      //
+                      // Awaited together under a single budget rather than one
+                      // deadline each, so a turn with several open requests
+                      // cannot hold the lifecycle gate for a multiple of it.
+                      if (orphanedApprovals.length > 0) {
                         yield* Effect.ignore(
-                          Deferred.await(approval.settled).pipe(
-                            Effect.timeoutOption(APPROVAL_SETTLE_TIMEOUT_MS),
-                          ),
+                          Effect.all(
+                            orphanedApprovals.map((approval) => Deferred.await(approval.settled)),
+                            { concurrency: "unbounded" },
+                          ).pipe(Effect.timeoutOption(APPROVAL_SETTLE_TIMEOUT_MS)),
                         );
                       }
                       // One prompt per turn, so this settles unconditionally.

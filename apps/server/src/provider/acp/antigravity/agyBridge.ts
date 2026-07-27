@@ -1231,6 +1231,8 @@ function drain(input: {
   readonly assistantText: { emitted: boolean };
   readonly turnToken: TurnToken;
   readonly final: boolean;
+  /** Defaults to true; set false to run hook and terminal cleanup only. */
+  readonly readTranscript?: boolean;
 }): boolean {
   for (const { name, event: hook } of readHookEvents(input.hookDir, input.seenHooks)) {
     // Diffing the file contents each hook captured, rather than the arguments
@@ -1280,7 +1282,8 @@ function drain(input: {
     }
   }
 
-  const transcriptPath = resolveTranscriptPath(input.state);
+  const transcriptPath =
+    input.readTranscript === false ? undefined : resolveTranscriptPath(input.state);
   let moreTranscript = false;
   if (transcriptPath) {
     let chunk = "";
@@ -1340,26 +1343,27 @@ function drain(input: {
     // conversation carries every prior turn. Trim once, then stream.
     if (!input.state.transcriptPrimed && allLines.length > 0) {
       const trimmed = dropPriorTurnRecords(allLines);
-      // Measured over the batch itself, not just the cursor's carry: `retain`
-      // puts whole lines back, and the next `push` hands them straight back
-      // here as complete lines. Carry stays small the whole time while the
-      // retained batch grows without limit, so budgeting on carry alone was no
-      // budget at all. Past the limit the batch is accepted as-is — replaying
-      // some earlier output is a worse transcript, but an unbounded hold is a
-      // worse process.
-      const heldChars =
-        input.cursor.carryLength + allLines.reduce((total, line) => total + line.length + 1, 0);
-      if (
-        trimmed.length === allLines.length &&
-        input.state.resumedConversation &&
-        !input.final &&
-        heldChars <= MAX_TRANSCRIPT_LINE_CHARS
-      ) {
-        // Resuming, and this batch holds no `USER_INPUT` — so the current
-        // turn's opening record has not been written yet and everything here
-        // belongs to a previous turn. Emitting it would replay old output;
-        // hold off and re-examine once more has been appended.
-        input.cursor.retain(allLines);
+      const foundBoundary = trimmed.length !== allLines.length;
+      if (input.state.resumedConversation && !input.final && moreTranscript) {
+        // Still short of the end of the file, so no `USER_INPUT` seen so far can
+        // be trusted to be this turn's: the current turn's opening record may
+        // sit in bytes not yet read. Reads are capped, so this is the ordinary
+        // case for a long transcript rather than an edge one.
+        //
+        // What is held back is `trimmed`, not the whole batch — history is
+        // discarded as it is scanned, which is both what the turn wants and
+        // what keeps the hold bounded to a single turn's output.
+        const heldChars =
+          input.cursor.carryLength + trimmed.reduce((total, line) => total + line.length + 1, 0);
+        if (!foundBoundary && heldChars > MAX_TRANSCRIPT_LINE_CHARS) {
+          // No boundary anywhere in a budget's worth of scanning. Give up on
+          // locating it and drop what was scanned: this turn loses whatever
+          // preceded this point, which is the right way to be wrong. Priming on
+          // it instead would replay another turn's output as this one's.
+          input.state.transcriptPrimed = true;
+        } else {
+          input.cursor.retain(trimmed);
+        }
         allLines = [];
       } else {
         allLines = [...trimmed];
@@ -1410,15 +1414,41 @@ function drain(input: {
         // Aged out one at a time, but refilled by every poll. Antigravity emits
         // internal steps far faster than one record per drain interval, so on a
         // transcript with unhookable steps the queue grows no matter how
-        // patiently the head expires. Trimmed from the front: the oldest held
-        // records are the ones whose hook is least likely to ever arrive.
+        // patiently the head expires.
+        //
+        // Overflow is consumed rather than discarded: a record stuck behind an
+        // unmatchable one may have had its own hook arrive in the meantime, and
+        // dropping it unexamined would lose that tool's output for good. Each is
+        // offered again on the way out; only those still unmatched are dropped.
         let heldChars = held.reduce((total, entry) => total + (entry.content?.length ?? 0), 0);
+        let trimmed = false;
         while (held.length > MAX_DEFERRED_RECORDS || heldChars > MAX_DEFERRED_CHARS) {
-          const dropped = held.shift();
-          if (dropped === undefined) {
+          const candidate = held.shift();
+          if (candidate === undefined) {
             break;
           }
-          heldChars -= dropped.content?.length ?? 0;
+          trimmed = true;
+          heldChars -= candidate.content?.length ?? 0;
+          const retried = transcriptRecordUpdates(candidate, input.state);
+          if (retried.deferred) {
+            continue;
+          }
+          for (const update of retried.updates) {
+            sendSessionUpdate(input.sessionId, update);
+          }
+          if (retried.emittedAssistantText) {
+            input.assistantText.emitted = true;
+          }
+          const retriedStep = candidate.step_index;
+          if (typeof retriedStep === "number") {
+            flushTerminal(input.sessionId, input.state, retriedStep);
+          }
+        }
+        if (trimmed) {
+          // The head that had been accruing age is gone, so its budget must not
+          // carry over to whatever is now in front — that record would expire
+          // without ever having waited.
+          input.state.deferredDrains = 0;
         }
         break;
       }
@@ -1712,6 +1742,11 @@ async function runTurn(
     assistantText,
     turnToken,
     final: true,
+    // Reading more after announcing truncation would emit records that follow
+    // the notice, and abandon everything past that one extra read just as
+    // silently. Once truncation is declared the transcript is closed; this pass
+    // exists only to flush hooks and any terminal state still owed.
+    readTranscript: !transcriptRemains,
   });
 
   // Any tool still open at exit would otherwise render as spinning forever.
