@@ -1365,10 +1365,11 @@ function drain(input: {
           !input.state.transcriptPrimingOverflowed &&
           !input.cursor.retainWithinLimit(trimmed, MAX_TRANSCRIPT_LINE_CHARS)
         ) {
-          // Give up on what was scanned, including the partial record at the
-          // read cutoff. Priming while unread bytes remain would replay another
-          // turn's output as this one's, and retaining again before a later
-          // boundary would merely rebuild the discarded historical suffix.
+          // Complete retained history is discarded, but a bounded partial line
+          // at the read cutoff is preserved because it may be this turn's
+          // USER_INPUT. Suppression remains active until that boundary is
+          // observed, so a historical record completed from the carry is still
+          // never emitted as current-turn output.
           input.state.transcriptPrimingOverflowed = true;
         }
         allLines = [];

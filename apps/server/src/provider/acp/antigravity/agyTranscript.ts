@@ -295,32 +295,19 @@ export class AgyTranscriptCursor {
    * the caller's budget.
    *
    * Resumed conversations are scanned from byte zero when no baseline was
-   * measurable. Dropping the whole candidate on overflow prevents an
-   * append-only history from accumulating in memory while the caller searches
-   * for the current turn's final `USER_INPUT` boundary.
+   * measurable. Complete history is expendable on overflow, but the bounded
+   * partial line may be the current turn's `USER_INPUT` boundary. Its caller
+   * keeps suppressing completed records until that boundary is observed, so
+   * preserving the partial line cannot surface historical output.
    */
   retainWithinLimit(lines: ReadonlyArray<string>, maxChars: number): boolean {
     const lineChars = lines.reduce((total, line) => total + line.length + 1, 0);
     if (this.carryLength + lineChars > maxChars) {
-      this.discardThroughNextNewline();
+      this.retained = [];
       return false;
     }
     this.retain(lines);
     return true;
-  }
-
-  /**
-   * Abandon everything scanned so far and resume after the current record.
-   *
-   * A capped read can stop inside a record. Clearing only the completed lines
-   * leaves that fragment in `carry`, where the next read can complete and emit
-   * a historical record as though it belonged to the current turn.
-   */
-  discardThroughNextNewline(): void {
-    const endedInsideRecord = this.carry.length > 0 || this.discarding;
-    this.carry = "";
-    this.retained = [];
-    this.discarding = endedInsideRecord;
   }
 
   /** Flush the trailing line once the writer is known to be finished. */

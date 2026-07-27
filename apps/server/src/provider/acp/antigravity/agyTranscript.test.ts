@@ -306,12 +306,38 @@ describe("AgyTranscriptCursor", () => {
     expect(cursor.push('{"current":true}\n')).toEqual(['{"current":true}']);
   });
 
-  it("counts a partial record when bounding a retained suffix", () => {
+  it("preserves a bounded partial boundary when retained history overflows", () => {
     const cursor = new AgyTranscriptCursor();
-    cursor.push("partial");
+    const boundary = '{"type":"USER_INPUT","content":"current turn"}';
+    const cutoff = 17;
+    cursor.push(boundary.slice(0, cutoff));
 
-    expect(cursor.retainWithinLimit(["12"], 9)).toBe(false);
-    expect(cursor.push(' tail\n{"current":true}\n')).toEqual(['{"current":true}']);
+    expect(cursor.retainWithinLimit(["historical"], 20)).toBe(false);
+    expect(cursor.carryLength).toBe(cutoff);
+    expect(cursor.push(`${boundary.slice(cutoff)}\n{"current":true}\n`)).toEqual([
+      boundary,
+      '{"current":true}',
+    ]);
+  });
+
+  it("keeps historical carry suppressible until a later boundary is observed", () => {
+    const cursor = new AgyTranscriptCursor();
+    const historical = '{"type":"PLANNER_RESPONSE","content":"old"}';
+    const boundary = '{"type":"USER_INPUT","content":"current turn"}';
+    const cutoff = 19;
+    cursor.push(historical.slice(0, cutoff));
+
+    expect(cursor.retainWithinLimit(["older history"], 24)).toBe(false);
+    const completedHistory = cursor.push(`${historical.slice(cutoff)}\n`);
+    // No boundary makes this eligible on its own; the bridge's overflow state
+    // is what suppresses it rather than losing the carry needed for parsing.
+    expect(dropPriorTurnRecords(completedHistory)).toEqual([historical]);
+
+    expect(
+      dropPriorTurnRecords(
+        cursor.push(`${boundary}\n{"type":"PLANNER_RESPONSE","content":"new"}\n`),
+      ),
+    ).toEqual(['{"type":"PLANNER_RESPONSE","content":"new"}']);
   });
 
   it("keeps counting consumed bytes across an abandoned record", () => {
@@ -324,22 +350,15 @@ describe("AgyTranscriptCursor", () => {
     expect(cursor.bytesConsumed).toBe(Buffer.byteLength(huge, "utf8"));
   });
 
-  it("discards a scanned partial record through its next newline", () => {
-    const cursor = new AgyTranscriptCursor();
-    cursor.push('{"historical":"partial');
-
-    cursor.discardThroughNextNewline();
-
-    expect(cursor.carryLength).toBe(0);
-    expect(cursor.push(' record"}\n{"current":true}\n')).toEqual(['{"current":true}']);
-  });
-
-  it("discards retained history when abandoning a scan", () => {
+  it("discards complete retained history while preserving a partial line", () => {
     const cursor = new AgyTranscriptCursor();
     cursor.retain(['{"historical":true}']);
+    cursor.push('{"type":"USER_INPUT"');
 
-    cursor.discardThroughNextNewline();
-
-    expect(cursor.push('{"current":true}\n')).toEqual(['{"current":true}']);
+    expect(cursor.retainWithinLimit([], 1)).toBe(false);
+    expect(cursor.push('}\n{"current":true}\n')).toEqual([
+      '{"type":"USER_INPUT"}',
+      '{"current":true}',
+    ]);
   });
 });

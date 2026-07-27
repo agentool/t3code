@@ -36,6 +36,7 @@ import {
   TurnId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -689,6 +690,12 @@ export function makeAntigravityAdapter(
             let resolutionPublished = false;
             return mapAcpCallbackFailure(
               Effect.gen(function* () {
+                // The bridge's own deadline is already running when this
+                // workflow starts. One absolute cutoff covers both queued event
+                // delivery and the user's decision, so time spent draining
+                // cannot leave a request actionable after the bridge has
+                // stopped accepting it.
+                const approvalDeadline = (yield* Clock.currentTimeMillis) + APPROVAL_WAIT_MS;
                 // Bound to the turn actually running, with the epoch that turn
                 // was accepted at — not the session's current epoch. A request
                 // from a cancelled turn can arrive after the epoch moved, and
@@ -738,10 +745,15 @@ export function makeAntigravityAdapter(
                 // belongs to. Teardown wins the race when that consumer is no
                 // longer available, which keeps a stopped session from holding
                 // the hook callback forever.
-                const eventStreamDrained = yield* Effect.raceFirst(
+                const drained = yield* Effect.raceFirst(
                   ctx.acp.drainEvents.pipe(Effect.as(true)),
                   Deferred.await(ctx.teardownSignal).pipe(Effect.as(false)),
+                ).pipe(
+                  Effect.timeoutOption(
+                    Math.max(0, approvalDeadline - (yield* Clock.currentTimeMillis)),
+                  ),
                 );
+                const eventStreamDrained = Option.isSome(drained) && drained.value;
                 if (
                   !eventStreamDrained ||
                   ctx.stopped ||
@@ -776,7 +788,9 @@ export function makeAntigravityAdapter(
                 // bridge forgets its side of a timed-out request, so without
                 // this the handler would stay blocked and the entry retained.
                 const answered = yield* Deferred.await(decision).pipe(
-                  Effect.timeoutOption(APPROVAL_WAIT_MS),
+                  Effect.timeoutOption(
+                    Math.max(0, approvalDeadline - (yield* Clock.currentTimeMillis)),
+                  ),
                 );
                 // An unanswered request denies, matching the bridge's own
                 // timeout: this gate must never resolve to "allow" by default.
