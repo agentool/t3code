@@ -876,9 +876,24 @@ function drain(input: {
           const buffer = Buffer.alloc(length);
           // `readSync` may return fewer bytes than asked for. Decoding the
           // whole buffer would feed the zero-filled tail through as content
-          // and skip the real bytes for good, so only what was actually read
-          // is consumed; the rest is picked up on the next poll.
-          const bytesRead = NodeFS.readSync(fd, buffer, 0, length, input.transcriptOffset.value);
+          // and skip the real bytes for good. Read until the measured range is
+          // filled rather than relying on the next poll — the final drain has
+          // no next poll, and would lose the tail along with whatever partial
+          // record the cursor is about to flush.
+          let bytesRead = 0;
+          while (bytesRead < length) {
+            const read = NodeFS.readSync(
+              fd,
+              buffer,
+              bytesRead,
+              length - bytesRead,
+              input.transcriptOffset.value + bytesRead,
+            );
+            if (read <= 0) {
+              break;
+            }
+            bytesRead += read;
+          }
           // Decoded through the turn's streaming decoder, not `toString`: a
           // write can land mid-multibyte-character, and decoding each slice
           // independently would replace the partial sequence with U+FFFD and

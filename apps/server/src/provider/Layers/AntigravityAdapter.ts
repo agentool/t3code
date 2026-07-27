@@ -332,6 +332,23 @@ export function makeAntigravityAdapter(
           }
           approvalsByThread.delete(ctx.threadId);
         }
+        // Claimed here, so a `sendTurn` finalizer waking later finds nothing
+        // left to settle and stays silent. Otherwise closing the scope wakes
+        // `acp.prompt` on another fiber and its completion lands after
+        // `session.exited` — or on whatever session replaced this one.
+        const orphanedTurnIds = [...ctx.startedTurnIds];
+        ctx.startedTurnIds.clear();
+        for (const orphanedTurnId of orphanedTurnIds) {
+          yield* offerRuntimeEvent({
+            type: "turn.completed",
+            ...(yield* makeEventStamp()),
+            provider: PROVIDER,
+            threadId: ctx.threadId,
+            turnId: orphanedTurnId,
+            payload: { state: "cancelled", stopReason: null },
+          });
+        }
+        ctx.activeTurnId = undefined;
         if (ctx.notificationFiber) {
           yield* Fiber.interrupt(ctx.notificationFiber);
         }
@@ -804,13 +821,19 @@ export function makeAntigravityAdapter(
             ctx.startedTurnIds.add(turnId);
           }
           if (announcing) {
-            yield* offerRuntimeEvent({
-              type: "turn.started",
-              ...(yield* makeEventStamp()),
-              provider: PROVIDER,
-              threadId: input.threadId,
-              turnId,
-              payload: { model: ctx.session.model },
+            // Stamp generation sits inside the guarded region: it can fail or
+            // be interrupted too, and a claim left behind without its event
+            // would make a steer skip the start and let settlement publish an
+            // orphan completion.
+            yield* Effect.gen(function* () {
+              yield* offerRuntimeEvent({
+                type: "turn.started",
+                ...(yield* makeEventStamp()),
+                provider: PROVIDER,
+                threadId: input.threadId,
+                turnId,
+                payload: { model: ctx.session.model },
+              });
             }).pipe(
               Effect.onExit((exit) =>
                 Exit.isSuccess(exit)
@@ -829,7 +852,15 @@ export function makeAntigravityAdapter(
                 if (ctx.cancelEpoch !== acceptedEpoch || ctx.stopped) {
                   return undefined;
                 }
-                return yield* ctx.acp.prompt({ prompt: promptParts });
+                const response = yield* ctx.acp.prompt({ prompt: promptParts });
+                // The bridge writes its `session/update` notifications before
+                // the prompt response, but the runtime only queues them.
+                // Draining inside the gate keeps the turn from settling — and
+                // its id from being cleared — while content, tool and item
+                // events are still pending, which would leave them
+                // unattributed or attributed to the next turn.
+                yield* ctx.acp.drainEvents;
+                return response;
               }),
             )
             .pipe(
