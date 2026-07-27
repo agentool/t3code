@@ -249,8 +249,25 @@ function lookupConversationId(sessionId: string): string | undefined {
 
 // ── JSON-RPC plumbing ─────────────────────────────────────────────────
 
+/**
+ * Set while stdout has reported that it is behind.
+ *
+ * Node buffers whatever `write` cannot hand over immediately, so ignoring its
+ * return value turns a slow reader into unbounded growth inside this process.
+ * Polling pauses while this is set. Nothing is lost by waiting: the transcript
+ * stays on disk and is read from its own byte offset, so a skipped poll only
+ * defers work to the next one.
+ */
+let stdoutBlocked = false;
+
 function writeMessage(value: unknown): void {
-  process.stdout.write(`${JSON.stringify(value)}\n`);
+  const flushed = process.stdout.write(`${JSON.stringify(value)}\n`);
+  if (!flushed && !stdoutBlocked) {
+    stdoutBlocked = true;
+    process.stdout.once("drain", () => {
+      stdoutBlocked = false;
+    });
+  }
 }
 
 function sendResult(id: unknown, result: unknown): void {
@@ -1720,6 +1737,12 @@ async function runTurn(
   });
 
   const poller = setInterval(() => {
+    // Skipped rather than queued behind a reader that is already behind. Only
+    // the interval pauses: the final drain below runs regardless, so a turn
+    // ending while stdout is congested still reports everything it owes.
+    if (stdoutBlocked) {
+      return;
+    }
     drain({
       sessionId,
       hookDir,

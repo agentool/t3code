@@ -754,9 +754,15 @@ export function makeAntigravityAdapter(
                   ),
                 );
                 const eventStreamDrained = Option.isSome(drained) && drained.value;
+                // Rechecked by turn identity, not only by epoch. A turn that
+                // ends on its own — `agy` exiting, or its print timeout — moves
+                // no epoch, so a request that waited out a slow consumer would
+                // open here against a turn settlement had already completed and
+                // then resolve it immediately afterwards.
                 if (
                   !eventStreamDrained ||
                   ctx.stopped ||
+                  ctx.activeTurnId !== approvalTurnId ||
                   (approvalEpoch !== undefined && approvalEpoch !== ctx.cancelEpoch)
                 ) {
                   pendingApprovals.delete(requestId);

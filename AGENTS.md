@@ -79,6 +79,19 @@ Known constraints, all inherent to print mode:
   a force-killed bridge can leave one `agy` behind until its `--print-timeout` elapses.
 - Any `agy` subcommand spawned for a probe must set `stdin: "ignore"`. `agy` starts a language
   server and will not emit output while stdin stays open, so the default `"pipe"` hangs it.
+- Runtime events are buffered without a cap, so a subscriber that stops consuming grows memory
+  until it resumes. This is the shape every adapter uses — Claude, Codex, Cursor, Grok and
+  OpenCode all publish through an unbounded queue or pub/sub, as does `ProviderService` itself —
+  so this provider follows it rather than diverging. Bounding it is a decision for the shared
+  runtime, not for one provider. What the bridge does bound is its own side: `writeMessage`
+  honours stdout backpressure and pauses polling while the pipe is behind, so a slow reader
+  cannot inflate the bridge process.
+- A transcript record carrying no `step_index` is ordered by where it was read, inheriting the
+  preceding entry's key. Every record observed in practice carries one. If a planner response
+  without an index were read in the same poll as the `PreToolUse` hook of the step after it, the
+  tool call would be announced first. Hooks have to be ingested before transcript records — a
+  record has nothing to attach to otherwise — so ordering the two exactly would need a shared
+  sequence number Antigravity does not emit.
 
 ## Reference Repos
 
