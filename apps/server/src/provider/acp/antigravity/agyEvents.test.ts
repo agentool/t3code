@@ -243,6 +243,18 @@ describe("orderAgySessionUpdates", () => {
       ]),
     ).toEqual([update("announce"), update("output"), update("complete")]);
   });
+
+  it("keeps an unindexed planner response between the steps surrounding it", () => {
+    const update = (name: string) => ({ name });
+
+    expect(
+      orderAgySessionUpdates([
+        { stepIdx: 2, phase: "transcript", update: update("step 2") },
+        { stepIdx: undefined, phase: "transcript", update: update("unindexed PLANNER_RESPONSE") },
+        { stepIdx: 3, phase: "transcript", update: update("step 3") },
+      ]),
+    ).toEqual([update("step 2"), update("unindexed PLANNER_RESPONSE"), update("step 3")]);
+  });
 });
 
 describe("approvalOutcomeToDecision", () => {

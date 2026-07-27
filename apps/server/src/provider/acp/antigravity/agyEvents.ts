@@ -302,13 +302,19 @@ export function orderAgySessionUpdates(
   entries: ReadonlyArray<AgyOrderedSessionUpdate>,
 ): ReadonlyArray<AgySessionUpdate> {
   const phaseOrder = { pre: 0, transcript: 1, terminal: 2 } as const;
-  return [...entries]
-    .sort((left, right) => {
-      const leftStep = left.stepIdx ?? Number.POSITIVE_INFINITY;
-      const rightStep = right.stepIdx ?? Number.POSITIVE_INFINITY;
-      return leftStep - rightStep || phaseOrder[left.phase] - phaseOrder[right.phase];
+  let precedingStep = Number.NEGATIVE_INFINITY;
+  return entries
+    .map((entry) => {
+      // PLANNER_RESPONSE records may omit step_index. Giving one the preceding
+      // key lets the stable sort leave it where the transcript reader put it,
+      // between that step and the next, instead of moving it to the batch end.
+      precedingStep = entry.stepIdx ?? precedingStep;
+      return { entry, step: precedingStep };
     })
-    .map((entry) => entry.update);
+    .sort((left, right) => {
+      return left.step - right.step || phaseOrder[left.entry.phase] - phaseOrder[right.entry.phase];
+    })
+    .map(({ entry }) => entry.update);
 }
 
 /**
