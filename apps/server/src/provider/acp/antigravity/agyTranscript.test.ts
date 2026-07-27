@@ -4,6 +4,7 @@ import { hookSessionUpdate, makeAgyTurnState, type AgyTurnState } from "./agyEve
 import {
   AgyTranscriptCursor,
   dropPriorTurnRecords,
+  MAX_TRANSCRIPT_LINE_CHARS,
   normalizeToolOutput,
   parseTranscriptLine,
   transcriptRecordUpdates,
@@ -246,5 +247,37 @@ describe("AgyTranscriptCursor", () => {
 
     expect(cursor.flush()).toEqual(['{"b":2}']);
     expect(cursor.flush()).toEqual([]);
+  });
+
+  it("gives up on a record that never terminates, and resumes at the next one", () => {
+    // Nothing else bounds a held-back line: the transcript is read in capped
+    // chunks, so a record with no newline would be accumulated in full.
+    const cursor = new AgyTranscriptCursor();
+    const huge = "x".repeat(MAX_TRANSCRIPT_LINE_CHARS + 1);
+
+    expect(cursor.push(huge)).toEqual([]);
+    expect(cursor.carryLength).toBe(0);
+
+    // The rest of the abandoned record is swallowed up to its newline; the
+    // record after it is intact.
+    expect(cursor.push('more-of-the-same\n{"a":1}\n')).toEqual(['{"a":1}']);
+  });
+
+  it("does not flush the tail of an abandoned record as if it were one", () => {
+    const cursor = new AgyTranscriptCursor();
+    cursor.push("y".repeat(MAX_TRANSCRIPT_LINE_CHARS + 1));
+
+    expect(cursor.push("trailing-fragment")).toEqual([]);
+    expect(cursor.flush()).toEqual([]);
+  });
+
+  it("keeps counting consumed bytes across an abandoned record", () => {
+    // The offset is what the next read starts from, so dropping content must
+    // not desynchronise it from the file.
+    const cursor = new AgyTranscriptCursor();
+    const huge = "z".repeat(MAX_TRANSCRIPT_LINE_CHARS + 1);
+    cursor.push(huge);
+
+    expect(cursor.bytesConsumed).toBe(Buffer.byteLength(huge, "utf8"));
   });
 });

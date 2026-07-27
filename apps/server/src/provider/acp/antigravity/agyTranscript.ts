@@ -29,6 +29,16 @@ export interface AgyTranscriptRecord {
  * particular holds a summary of truncated context and would read as the
  * assistant talking to itself.
  */
+/**
+ * Ceiling on a single held-back transcript line.
+ *
+ * The transcript is read incrementally, so nothing else bounds a record that
+ * never terminates: the cursor would hold every byte of it waiting for a
+ * newline. Generous enough that a real tool output is never truncated — the
+ * largest observed records are a few hundred KiB.
+ */
+export const MAX_TRANSCRIPT_LINE_CHARS = 4 * 1024 * 1024;
+
 const IGNORED_RECORD_TYPES = new Set([
   "CONVERSATION_HISTORY",
   "CHECKPOINT",
@@ -201,9 +211,20 @@ export function dropPriorTurnRecords(lines: ReadonlyArray<string>): ReadonlyArra
 export class AgyTranscriptCursor {
   private offset = 0;
   private carry = "";
+  /**
+   * Set once a single record has grown past {@link MAX_TRANSCRIPT_LINE_CHARS}.
+   * Its bytes keep arriving, so the remainder is swallowed up to the next
+   * newline rather than surfacing as a fragment that parses as nothing.
+   */
+  private discarding = false;
 
   get bytesConsumed(): number {
     return this.offset;
+  }
+
+  /** Size of the held-back partial line, for callers enforcing their own budget. */
+  get carryLength(): number {
+    return this.carry.length;
   }
 
   /**
@@ -215,7 +236,27 @@ export class AgyTranscriptCursor {
     const combined = this.carry + chunk;
     const lines = combined.split("\n");
     this.carry = lines.pop() ?? "";
-    return lines;
+
+    let completed: ReadonlyArray<string> = lines;
+    if (this.discarding) {
+      // The first line to complete here is the tail of the record that was
+      // given up on; everything after it is intact.
+      if (lines.length > 0) {
+        completed = lines.slice(1);
+        this.discarding = false;
+      } else {
+        completed = [];
+      }
+    }
+
+    // A record with no newline in sight would otherwise be held in full, so a
+    // single malformed or enormous transcript entry could exhaust memory no
+    // matter how small each read is.
+    if (this.carry.length > MAX_TRANSCRIPT_LINE_CHARS) {
+      this.carry = "";
+      this.discarding = true;
+    }
+    return completed;
   }
 
   /**
@@ -233,6 +274,11 @@ export class AgyTranscriptCursor {
   flush(): ReadonlyArray<string> {
     const remaining = this.carry;
     this.carry = "";
+    if (this.discarding) {
+      // Whatever is left is the tail of an abandoned record, not a record.
+      this.discarding = false;
+      return [];
+    }
     return remaining.trim().length > 0 ? [remaining] : [];
   }
 }

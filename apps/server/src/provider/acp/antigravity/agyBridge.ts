@@ -14,6 +14,7 @@
  */
 // @effect-diagnostics nodeBuiltinImport:off - Standalone stdio bridge process, not an Effect runtime.
 // @effect-diagnostics globalTimers:off - Polls Antigravity hook output outside any Effect runtime.
+// @effect-diagnostics globalDate:off - Approval deadlines are measured in the hook subprocess, which has no Clock.
 /* eslint-disable t3code/no-global-process-runtime -- Standalone process: there
    is no Effect runtime here to inject HostProcessPlatform from. */
 import * as NodeChildProcess from "node:child_process";
@@ -43,6 +44,7 @@ import {
 import {
   AgyTranscriptCursor,
   dropPriorTurnRecords,
+  MAX_TRANSCRIPT_LINE_CHARS,
   parseTranscriptLine,
   transcriptRecordUpdates,
 } from "./agyTranscript.ts";
@@ -76,6 +78,20 @@ const MAX_DEFERRED_DRAINS = 20;
  * only needs to explain a failure.
  */
 const MAX_CAPTURED_OUTPUT = 256 * 1024;
+
+/**
+ * Ceiling on one transcript read. Keeps a single poll from allocating a buffer
+ * the size of whatever a tool just wrote; the rest is read by the next poll.
+ */
+const MAX_TRANSCRIPT_READ_BYTES = 1024 * 1024;
+
+/**
+ * Backstop on how many extra passes the final drain will make to consume a
+ * transcript tail larger than one read. Set far above any real transcript —
+ * this exists so a file being appended to faster than it is read cannot spin
+ * the exit path forever, not to bound normal output.
+ */
+const MAX_FINAL_DRAIN_PASSES = 512;
 const DEFAULT_PRINT_TIMEOUT = "2h";
 const HOOKS_KEY = "t3code-antigravity-observer";
 
@@ -427,6 +443,18 @@ function readHookEvents(hookDir: string, seen: Set<string>): ReadonlyArray<Obser
         }
         hookPayloadDigests.set(name, digestPayload(raw));
         events.push({ name, event: { ...record, payload } });
+        // Reclaimed as soon as its contents are in memory. An edit hook carries
+        // the file it is about to change, up to `MAX_CAPTURED_FILE_BYTES` each,
+        // and the directory only went away at the end of the turn — so a long
+        // turn editing large files held every version of every one of them on
+        // disk at once. The waiting hook never reads this file back; it polls
+        // for its `.decision` sibling, which is written separately.
+        try {
+          NodeFS.unlinkSync(NodePath.join(hookDir, name));
+        } catch {
+          // Losing the reclaim is not worth failing the hook over; the whole
+          // directory is removed when the turn ends.
+        }
       }
     } catch {
       // A half-written hook file is picked up on the next poll.
@@ -1192,7 +1220,7 @@ function drain(input: {
   readonly assistantText: { emitted: boolean };
   readonly turnToken: TurnToken;
   readonly final: boolean;
-}): void {
+}): boolean {
   for (const { name, event: hook } of readHookEvents(input.hookDir, input.seenHooks)) {
     // Diffing the file contents each hook captured, rather than the arguments
     // of the edit, keeps this correct across tools whose argument shapes
@@ -1242,6 +1270,7 @@ function drain(input: {
   }
 
   const transcriptPath = resolveTranscriptPath(input.state);
+  let moreTranscript = false;
   if (transcriptPath) {
     let chunk = "";
     try {
@@ -1249,7 +1278,15 @@ function drain(input: {
       if (stats.size > input.transcriptOffset.value) {
         const fd = NodeFS.openSync(transcriptPath, "r");
         try {
-          const length = stats.size - input.transcriptOffset.value;
+          // Capped rather than sized to the whole unread region: a tool that
+          // writes a very large record would otherwise have the bridge
+          // allocate a buffer as big as its output in one go, which the 256
+          // KiB stdout cap does nothing to prevent. Whatever is left is picked
+          // up by the next poll, and the final drain loops until it is gone.
+          const length = Math.min(
+            stats.size - input.transcriptOffset.value,
+            MAX_TRANSCRIPT_READ_BYTES,
+          );
           const buffer = Buffer.alloc(length);
           // `readSync` may return fewer bytes than asked for. Decoding the
           // whole buffer would feed the zero-filled tail through as content
@@ -1277,6 +1314,7 @@ function drain(input: {
           // advance past it, silently corrupting non-ASCII output.
           chunk = bytesRead > 0 ? input.decoder.write(buffer.subarray(0, bytesRead)) : "";
           input.transcriptOffset.value += bytesRead;
+          moreTranscript = stats.size > input.transcriptOffset.value && bytesRead > 0;
         } finally {
           NodeFS.closeSync(fd);
         }
@@ -1291,7 +1329,17 @@ function drain(input: {
     // conversation carries every prior turn. Trim once, then stream.
     if (!input.state.transcriptPrimed && allLines.length > 0) {
       const trimmed = dropPriorTurnRecords(allLines);
-      if (trimmed.length === allLines.length && input.state.resumedConversation && !input.final) {
+      if (
+        trimmed.length === allLines.length &&
+        input.state.resumedConversation &&
+        !input.final &&
+        // Held content is re-examined against every later read, so a
+        // conversation whose opening record never appears would accumulate the
+        // whole transcript in the cursor. Past the budget the batch is accepted
+        // as-is: replaying some earlier output is a worse transcript, but an
+        // unbounded hold is a worse process.
+        input.cursor.carryLength <= MAX_TRANSCRIPT_LINE_CHARS
+      ) {
         // Resuming, and this batch holds no `USER_INPUT` — so the current
         // turn's opening record has not been written yet and everything here
         // belongs to a previous turn. Emitting it would replay old output;
@@ -1369,6 +1417,8 @@ function drain(input: {
       sendSessionUpdate(input.sessionId, terminal);
     }
   }
+
+  return moreTranscript;
 }
 
 function flushTerminal(sessionId: string, state: AgyTurnState, stepIdx: number): void {
@@ -1403,6 +1453,13 @@ function resolveTranscriptPath(state: AgyTurnState): string | undefined {
   state.resolvedTranscriptPath = NodeFS.existsSync(condensed) ? condensed : reported;
   return state.resolvedTranscriptPath;
 }
+
+/**
+ * Thrown when a cancel lands in the window between claiming the turn and
+ * spawning `agy`. Carries no message: it never surfaces to the client, it only
+ * unwinds setup through the same path a spawn failure takes.
+ */
+class TurnCancelledBeforeSpawn extends Error {}
 
 async function runTurn(
   sessionId: string,
@@ -1443,6 +1500,24 @@ async function runTurn(
     if (attachmentDir) {
       activeTurnTempDirs.add(attachmentDir);
     }
+    // Yielded to the event loop once, with the claim held and the directories
+    // staged, before anything is spawned.
+    //
+    // Everything above this point is synchronous, so a `t3/fence` or
+    // `session/cancel` already sitting in the stdin buffer could not be parsed
+    // until after `agy` was running: the turn the user stopped still reached
+    // the model, and was only killed afterwards. One turn of the event loop is
+    // enough for the reader to deliver it, and the recheck below then declines
+    // to spawn at all.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (
+      shuttingDown ||
+      cancelledSessions.has(sessionId) ||
+      (promptEpoch !== undefined && promptEpoch <= cancelledThrough(sessionId))
+    ) {
+      throw new TurnCancelledBeforeSpawn();
+    }
+
     const command = process.env["T3_AGY_COMMAND"]?.trim() || "agy";
     child = NodeChildProcess.spawn(
       command,
@@ -1463,15 +1538,24 @@ async function runTurn(
       },
     );
   } catch (error) {
-    // Setup failed, so no turn is running: release the claim and reclaim the
-    // directories, or repeated failures would leak one set each time.
+    // Setup failed or the turn was cancelled before it started, so no turn is
+    // running: release the claim and reclaim the directories, or repeated
+    // failures would leak one set each time.
     activeTurnSessionId = null;
+    activeTurnEpoch = undefined;
     cleanupDir(hookDir);
     cleanupDir(hookWorkspace);
     cleanupDir(attachmentDir);
     if (hookDir) activeTurnTempDirs.delete(hookDir);
     if (hookWorkspace) activeTurnTempDirs.delete(hookWorkspace);
     if (attachmentDir) activeTurnTempDirs.delete(attachmentDir);
+    if (error instanceof TurnCancelledBeforeSpawn) {
+      // Nothing ran, so there is nothing to report but the cancellation. The
+      // flag is consumed here because no later stage will reach the drain that
+      // normally clears it.
+      cancelledSessions.delete(sessionId);
+      return { stopReason: "cancelled" };
+    }
     throw error;
   }
 
@@ -1554,6 +1638,28 @@ async function runTurn(
   clearInterval(poller);
   activeChild = null;
   activeTurnSessionId = null;
+  // Each pass reads at most `MAX_TRANSCRIPT_READ_BYTES`, so the tail of a large
+  // transcript needs several. Only the last one runs as `final`: flushing the
+  // cursor while bytes remain would emit a half-written record as if it were
+  // whole, and leave the rest of that line to be read as a fragment.
+  let finalPasses = 0;
+  while (
+    drain({
+      sessionId,
+      hookDir,
+      seenHooks,
+      state,
+      cursor,
+      decoder,
+      transcriptOffset,
+      assistantText,
+      turnToken,
+      final: false,
+    }) &&
+    finalPasses < MAX_FINAL_DRAIN_PASSES
+  ) {
+    finalPasses += 1;
+  }
   drain({
     sessionId,
     hookDir,
@@ -1604,7 +1710,31 @@ async function runTurn(
     activeTurnTempDirs.delete(attachmentDir);
   }
 
-  if (cancelledSessions.delete(sessionId)) {
+  const cancelled = cancelledSessions.delete(sessionId);
+
+  // The transcript already streamed the assistant text. stdout is only used
+  // when transcript observation produced nothing, so the reply is never
+  // duplicated.
+  //
+  // Emitted before the cancelled check, not after: a turn stopped mid-reply is
+  // exactly the case where the transcript may not have been discovered yet,
+  // and the partial answer already captured from stdout is the only record of
+  // what the model said. A nonzero exit is excluded because it reports the same
+  // bytes as its failure detail.
+  if ((cancelled || exitCode === 0) && !assistantText.emitted && stdout.trim().length > 0) {
+    // Says so when it is only the tail. Presenting a suffix as the whole reply
+    // reads as a complete answer that happens to begin mid-sentence, which is
+    // worse than admitting the beginning was dropped.
+    const text = stdoutTruncated
+      ? `[Earlier output dropped: the reply exceeded ${Math.floor(MAX_CAPTURED_OUTPUT / 1024)} KiB.]\n\n${stdout.trim()}`
+      : stdout.trim();
+    sendSessionUpdate(sessionId, {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text },
+    });
+  }
+
+  if (cancelled) {
     return { stopReason: "cancelled" };
   }
   if (exitCode !== 0) {
@@ -1618,21 +1748,6 @@ async function runTurn(
     return { stopReason: "end_turn", failure: detail };
   }
 
-  // The transcript already streamed the assistant text. stdout is only used
-  // when transcript observation produced nothing, so the reply is never
-  // duplicated.
-  if (!assistantText.emitted && stdout.trim().length > 0) {
-    // Says so when it is only the tail. Presenting a suffix as the whole reply
-    // reads as a complete answer that happens to begin mid-sentence, which is
-    // worse than admitting the beginning was dropped.
-    const text = stdoutTruncated
-      ? `[Earlier output dropped: the reply exceeded ${Math.floor(MAX_CAPTURED_OUTPUT / 1024)} KiB.]\n\n${stdout.trim()}`
-      : stdout.trim();
-    sendSessionUpdate(sessionId, {
-      sessionUpdate: "agent_message_chunk",
-      content: { type: "text", text },
-    });
-  }
   return { stopReason: "end_turn" };
 }
 

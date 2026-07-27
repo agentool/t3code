@@ -762,8 +762,17 @@ export function makeAntigravityAdapter(
                 );
                 // Re-checked at the moment of answering: an approval decided
                 // while Stop was landing must not come back as an allow.
+                //
+                // Turn identity is part of that check, not just the epoch. Two
+                // consecutive turns with no cancel between them share an epoch,
+                // so a request still open when its own turn ended would look
+                // current again once the next one started, and this would
+                // answer "allow" for a tool whose token the bridge has already
+                // retired. The bridge denies it either way — the damage is a UI
+                // reporting an approval that was never honoured.
                 const stillLive =
                   !ctx?.stopped &&
+                  ctx?.activeTurnId === approvalTurnId &&
                   (approvalEpoch === undefined || ctx?.cancelEpoch === approvalEpoch);
                 const optionId =
                   resolved === "cancel" || !stillLive

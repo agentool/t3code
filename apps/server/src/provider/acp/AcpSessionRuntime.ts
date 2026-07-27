@@ -749,7 +749,13 @@ export const make = (
                   yield* Ref.set(activePromptFiberRef, Option.none());
                 }),
               ),
-              Effect.tap(() =>
+              // Closed however the prompt ends, not only when it succeeds. An
+              // agent that streamed some text and then failed the RPC left its
+              // segment open, and the next prompt closed it on the way in —
+              // after the caller had moved to a new turn, so the `item.completed`
+              // landed on the wrong one. A failed prompt still ends whatever it
+              // was saying.
+              Effect.ensuring(
                 closeActiveAssistantSegment({
                   queue: eventQueue,
                   assistantSegmentRef,
