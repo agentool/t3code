@@ -441,6 +441,13 @@ export function makeAntigravityAdapter(
        * in the meantime would take its replacement down with it.
        */
       onlyIfActiveTurn?: TurnId,
+      /**
+       * Additional condition rechecked under the gate. The fallback's reason to
+       * stop — the bridge never acknowledged — can stop being true between it
+       * deciding and this claiming, and the turn stays active while its events
+       * drain, so the turn id alone does not settle it.
+       */
+      onlyIf?: () => boolean,
     ) => {
       // Whether this call is the one that claimed the teardown. The cleanup
       // below must not run otherwise: a call that declined because the turn had
@@ -456,6 +463,9 @@ export function makeAntigravityAdapter(
               return undefined;
             }
             if (onlyIfActiveTurn !== undefined && ctx.activeTurnId !== onlyIfActiveTurn) {
+              return undefined;
+            }
+            if (onlyIf !== undefined && !onlyIf()) {
               return undefined;
             }
             ctx.stopped = true;
@@ -1411,9 +1421,11 @@ export function makeAntigravityAdapter(
                 // ten seconds late, and the check has to happen under the same
                 // gate that claims the stop or a turn that settled meanwhile
                 // takes its replacement down with it.
-                ctx.awaitingBridgeAck.has(cancelledTurnId)
-                  ? Effect.ignore(stopSessionInternal(ctx, cancelledTurnId))
-                  : Effect.void,
+                Effect.ignore(
+                  stopSessionInternal(ctx, cancelledTurnId, () =>
+                    ctx.awaitingBridgeAck.has(cancelledTurnId),
+                  ),
+                ),
               ),
             ),
             ctx.scope,

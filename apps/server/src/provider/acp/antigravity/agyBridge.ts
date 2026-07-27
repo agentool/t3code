@@ -961,25 +961,53 @@ let activeChild: NodeChildProcess.ChildProcess | null = null;
  * output can still arrive against a turn that has been reported cancelled.
  */
 /**
- * Process groups signalled but not yet confirmed dead.
+ * Groups signalled but not yet confirmed dead, keyed by the child that owns
+ * them so a pending escalation can be cancelled and never runs twice.
  *
- * `agy` can exit on SIGTERM while a tool it started ignores the signal, and
- * `runTurn` then clears `activeChild`. Only the pending escalation still knew
- * that group existed — and a shutdown inside that window runs no timers, so the
- * tool survived with nothing left to stop it.
+ * A group id is only safe to signal while a member is alive: once the group is
+ * empty the OS may reuse the number, and a delayed SIGKILL would land on
+ * whatever inherited it.
  */
-const pendingKillGroups = new Set<number>();
+const pendingKills = new Map<
+  NodeChildProcess.ChildProcess,
+  { readonly pid: number; timer?: ReturnType<typeof setTimeout> }
+>();
+
+function signalGroupOf(
+  child: NodeChildProcess.ChildProcess,
+  pid: number,
+  signal: NodeJS.Signals,
+): void {
+  try {
+    // Negative pid targets the group, which `detached: true` gave the child.
+    process.kill(-pid, signal);
+  } catch {
+    // Already gone, or never got a group; fall back to the child alone.
+    try {
+      child.kill(signal);
+    } catch {
+      // Nothing left to signal.
+    }
+  }
+}
+
+function clearPendingKill(child: NodeChildProcess.ChildProcess): void {
+  const pending = pendingKills.get(child);
+  if (pending?.timer) {
+    clearTimeout(pending.timer);
+  }
+  pendingKills.delete(child);
+}
 
 /** SIGKILL every group still awaiting escalation. Used on shutdown. */
 function killPendingGroups(): void {
-  for (const pid of pendingKillGroups) {
-    try {
-      process.kill(-pid, "SIGKILL");
-    } catch {
-      // Already gone.
+  for (const [child, pending] of pendingKills) {
+    signalGroupOf(child, pending.pid, "SIGKILL");
+    if (pending.timer) {
+      clearTimeout(pending.timer);
     }
   }
-  pendingKillGroups.clear();
+  pendingKills.clear();
 }
 
 function killActiveChild(options?: { readonly immediate?: boolean }): void {
@@ -1003,35 +1031,40 @@ function killActiveChild(options?: { readonly immediate?: boolean }): void {
     }
     return;
   }
-  const signalGroup = (signal: NodeJS.Signals) => {
-    try {
-      // Negative pid targets the group, which `detached: true` gave the child.
-      process.kill(-pid, signal);
-    } catch {
-      // Already gone, or never got a group; fall back to the child alone.
-      try {
-        child.kill(signal);
-      } catch {
-        // Nothing left to signal.
-      }
-    }
-  };
   if (options?.immediate) {
-    signalGroup("SIGKILL");
-    pendingKillGroups.delete(pid);
+    signalGroupOf(child, pid, "SIGKILL");
+    clearPendingKill(child);
     return;
   }
-  signalGroup("SIGTERM");
-  pendingKillGroups.add(pid);
-  // Escalation does not depend on the leader still being alive. `agy` can exit
-  // on SIGTERM while a tool it started ignores the signal and keeps the group —
-  // and the workspace — busy; signalling a group that has genuinely gone is
-  // harmless, the error is caught above.
+  if (pendingKills.has(child)) {
+    // Already signalled — a fence and the cancel behind it both land here. A
+    // second timer would be another delayed signal nobody cancels.
+    return;
+  }
+  signalGroupOf(child, pid, "SIGTERM");
+  const pending: { readonly pid: number; timer?: ReturnType<typeof setTimeout> } = { pid };
+  pendingKills.set(child, pending);
+  // `agy` can die on SIGTERM while a tool it started ignores it and keeps the
+  // group busy. Killing at that moment is what makes the group id safe to use:
+  // it belongs to us while any member lives, and this runs the instant the
+  // leader goes rather than seconds later, when the number may have been
+  // recycled onto something unrelated.
+  child.once("exit", () => {
+    if (pendingKills.get(child) === pending) {
+      signalGroupOf(child, pid, "SIGKILL");
+      clearPendingKill(child);
+    }
+  });
+  // Backstop for a leader that ignores SIGTERM outright. Safe to target by
+  // group, because the leader is by definition still alive if this fires.
   const escalation = setTimeout(() => {
-    signalGroup("SIGKILL");
-    pendingKillGroups.delete(pid);
+    if (pendingKills.get(child) === pending && child.exitCode === null) {
+      signalGroupOf(child, pid, "SIGKILL");
+    }
+    clearPendingKill(child);
   }, KILL_ESCALATION_MS);
   escalation.unref?.();
+  pending.timer = escalation;
 }
 /** Session whose turn is currently running, if any. Gates `session/cancel`. */
 let activeTurnSessionId: string | null = null;
