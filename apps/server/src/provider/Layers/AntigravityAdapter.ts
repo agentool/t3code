@@ -1209,14 +1209,25 @@ export function makeAntigravityAdapter(
         // Fallback: if the bridge never answers — wedged, or already gone — the
         // interrupt still happens, just late enough not to truncate a healthy
         // drain. Forked into the session scope so it dies with the session.
-        yield* Effect.forkIn(
-          Effect.sleep(CANCEL_ACK_TIMEOUT_MS).pipe(
-            Effect.flatMap(() =>
-              ctx.activeTurnId === undefined ? Effect.void : Effect.ignore(ctx.acp.cancel),
+        //
+        // Scoped to the turn being cancelled by identity, not to "some turn is
+        // active". This cancel can settle normally and a fresh turn start
+        // inside the timeout; `acp.cancel` interrupts whatever prompt the
+        // runtime currently holds, so a laxer check would interrupt that new
+        // turn — and the bridge would ignore the accompanying cancel, its
+        // epoch being newer than this fence, leaving `agy` running while T3
+        // believed the turn was cancelled.
+        const cancelledTurnId = ctx.activeTurnId;
+        if (cancelledTurnId !== undefined) {
+          yield* Effect.forkIn(
+            Effect.sleep(CANCEL_ACK_TIMEOUT_MS).pipe(
+              Effect.flatMap(() =>
+                ctx.activeTurnId === cancelledTurnId ? Effect.ignore(ctx.acp.cancel) : Effect.void,
+              ),
             ),
-          ),
-          ctx.scope,
-        );
+            ctx.scope,
+          );
+        }
       });
 
     // `agy` itself always runs with permissions skipped — print mode cannot
