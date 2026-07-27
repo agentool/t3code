@@ -1507,19 +1507,25 @@ async function runTurn(
   // and stderr only has to carry enough to explain a failure.
   let stdout = "";
   let stderr = "";
-  const appendBounded = (current: string, chunk: string): string => {
+  let stdoutTruncated = false;
+  let stderrTruncated = false;
+  const appendBounded = (current: string, chunk: string): [string, boolean] => {
     const combined = current + chunk;
     return combined.length <= MAX_CAPTURED_OUTPUT
-      ? combined
-      : combined.slice(combined.length - MAX_CAPTURED_OUTPUT);
+      ? [combined, false]
+      : [combined.slice(combined.length - MAX_CAPTURED_OUTPUT), true];
   };
   child.stdout?.setEncoding("utf8");
   child.stdout?.on("data", (chunk: string) => {
-    stdout = appendBounded(stdout, chunk);
+    const [next, dropped] = appendBounded(stdout, chunk);
+    stdout = next;
+    stdoutTruncated = stdoutTruncated || dropped;
   });
   child.stderr?.setEncoding("utf8");
   child.stderr?.on("data", (chunk: string) => {
-    stderr = appendBounded(stderr, chunk);
+    const [next, dropped] = appendBounded(stderr, chunk);
+    stderr = next;
+    stderrTruncated = stderrTruncated || dropped;
   });
 
   const poller = setInterval(() => {
@@ -1599,7 +1605,13 @@ async function runTurn(
     return { stopReason: "cancelled" };
   }
   if (exitCode !== 0) {
-    const detail = stderr.trim() || stdout.trim() || `agy exited with code ${exitCode}`;
+    const captured = stderr.trim() || stdout.trim();
+    const truncated = stderr.trim() ? stderrTruncated : stdoutTruncated;
+    const detail = captured
+      ? truncated
+        ? `[earlier output dropped] ${captured}`
+        : captured
+      : `agy exited with code ${exitCode}`;
     return { stopReason: "end_turn", failure: detail };
   }
 
@@ -1607,9 +1619,15 @@ async function runTurn(
   // when transcript observation produced nothing, so the reply is never
   // duplicated.
   if (!assistantText.emitted && stdout.trim().length > 0) {
+    // Says so when it is only the tail. Presenting a suffix as the whole reply
+    // reads as a complete answer that happens to begin mid-sentence, which is
+    // worse than admitting the beginning was dropped.
+    const text = stdoutTruncated
+      ? `[Earlier output dropped: the reply exceeded ${Math.floor(MAX_CAPTURED_OUTPUT / 1024)} KiB.]\n\n${stdout.trim()}`
+      : stdout.trim();
     sendSessionUpdate(sessionId, {
       sessionUpdate: "agent_message_chunk",
-      content: { type: "text", text: stdout.trim() },
+      content: { type: "text", text },
     });
   }
   return { stopReason: "end_turn" };
@@ -1779,40 +1797,36 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
     }
     case "session/cancel": {
       const sessionId = typeof params["sessionId"] === "string" ? params["sessionId"] : undefined;
-      if (sessionId && sessions.has(sessionId) && sessionId !== activeTurnSessionId) {
-        // No turn running for it yet. Banked only when a prompt is genuinely
-        // waiting: a cancel that merely arrived after its own turn finished
-        // would otherwise sit here and stop something sent much later. A prompt
-        // carrying an epoch is already covered by the mark and consumes no
-        // marker, so this only ever applies to an untagged one.
+      if (!sessionId || !sessions.has(sessionId)) {
+        return;
+      }
+      // Recorded before anything else. A cancel bypasses the request queue and
+      // its prompt does not, so the two can arrive together with the prompt
+      // still waiting — and returning early below would drop the epoch and let
+      // that prompt spawn `agy` after the Stop that was meant to catch it.
+      const cancelEpoch = typeof params["epoch"] === "number" ? params["epoch"] : undefined;
+      if (cancelEpoch !== undefined) {
+        cancelledThroughEpoch.set(sessionId, Math.max(cancelledThrough(sessionId), cancelEpoch));
+      }
+      if (sessionId !== activeTurnSessionId) {
+        // No turn running for it yet. An untagged prompt has no epoch to be
+        // measured against, so it needs a marker — banked only when one is
+        // genuinely waiting, or a cancel that merely arrived after its own turn
+        // finished would sit here and stop something sent much later.
         if (queuedUntagged(sessionId) > 0) {
           unscopedCancels.add(sessionId);
         }
         return;
       }
-      if (sessionId && sessions.has(sessionId) && sessionId === activeTurnSessionId) {
-        // Only the turn actually running is stopped, and only when its epoch
-        // has been cancelled. A prompt accepted after the fence carries a
-        // higher epoch and must survive this notification, which the runtime
-        // forks and can therefore deliver late.
-        //
-        // A cancel carries the epoch it covers, so it can stand in for a fence
-        // that failed to send without reaching past its own turn. Promoting the
-        // mark to whatever happened to be running would let a late cancel kill
-        // a prompt accepted after it — the runtime forks this notification, so
-        // arriving late is normal.
-        const cancelEpoch = typeof params["epoch"] === "number" ? params["epoch"] : undefined;
-        if (cancelEpoch !== undefined) {
-          cancelledThroughEpoch.set(sessionId, Math.max(cancelledThrough(sessionId), cancelEpoch));
-        }
-        // Judged by the running turn's own mode, not by anything the session
-        // did earlier. A turn whose prompt carried no epoch cannot be scoped by
-        // a mark it never contributed to, so it takes plain ACP semantics; one
-        // that carried an epoch is stopped only if that epoch was cancelled.
-        if (activeTurnEpoch === undefined || activeTurnEpoch <= cancelledThrough(sessionId)) {
-          cancelledSessions.add(sessionId);
-          killActiveChild();
-        }
+      // Only the turn actually running is stopped, and only when its epoch has
+      // been cancelled: a prompt accepted after the fence carries a higher one
+      // and must survive this notification, which the runtime forks and can
+      // therefore deliver late. A turn whose prompt carried no epoch cannot be
+      // scoped by a mark it never contributed to, so it takes plain ACP
+      // semantics.
+      if (activeTurnEpoch === undefined || activeTurnEpoch <= cancelledThrough(sessionId)) {
+        cancelledSessions.add(sessionId);
+        killActiveChild();
       }
       return;
     }
