@@ -856,6 +856,17 @@ const cancelGenerations = new Map<string, number>();
  * was meant for.
  */
 const fencedPromptIds = new Set<string>();
+/**
+ * Upper bound on remembered fences. A fence whose prompt already arrived is
+ * applied immediately instead of stored, so this only holds ids still in
+ * transit; the cap exists so a client that fences prompts it never sends
+ * cannot grow the set without limit.
+ */
+const MAX_FENCED_PROMPT_IDS = 256;
+/** Prompt id of the turn currently running, so a fence can reach it. */
+let activeTurnPromptId: string | undefined;
+/** Token of the turn currently running, retired when its prompt is fenced. */
+let activeTurnToken: TurnToken | undefined;
 
 /** The adapter's per-submission id, carried in `_meta.t3.promptId`. */
 function promptIdOf(params: Record<string, unknown>): string | undefined {
@@ -1067,6 +1078,7 @@ async function runTurn(
   sessionId: string,
   session: BridgeSession,
   prompt: RenderedPrompt,
+  promptId: string | undefined,
 ): Promise<TurnOutcome> {
   // A cancel that raced the end of an earlier turn must not decide this one.
   cancelledSessions.delete(sessionId);
@@ -1127,6 +1139,10 @@ async function runTurn(
   }
   const assistantText = { emitted: false };
   const turnToken: TurnToken = { sessionId, live: true };
+  // Published so an out-of-band fence naming this prompt can retire the turn
+  // rather than being stored for an arrival that already happened.
+  activeTurnPromptId = promptId;
+  activeTurnToken = turnToken;
   activeChild = child;
   // A cancel during startup had no process to signal; deliver it now.
   if (cancelledSessions.has(sessionId)) {
@@ -1203,6 +1219,12 @@ async function runTurn(
   // now resolves to a denial rather than writing into a vanishing directory or
   // banking a blanket approval for the next turn.
   turnToken.live = false;
+  activeTurnPromptId = undefined;
+  activeTurnToken = undefined;
+  if (promptId !== undefined) {
+    // Its fence, if any, has been dealt with; nothing may consume it later.
+    fencedPromptIds.delete(promptId);
+  }
   cleanupDir(hookDir);
   cleanupDir(hookWorkspace);
   cleanupDir(attachmentDir);
@@ -1348,7 +1370,7 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
         sendError(id, -32602, "session/prompt requires at least one text block");
         return;
       }
-      const outcome = await runTurn(sessionId, session, prompt);
+      const outcome = await runTurn(sessionId, session, prompt, promptId);
       if (outcome.failure) {
         sendError(id, -32000, `Antigravity turn failed: ${outcome.failure}`);
         return;
@@ -1360,9 +1382,27 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
     // a prompt outstanding. Notifications carry no id, so nothing is replied.
     case "t3/fence": {
       const promptId = typeof params["promptId"] === "string" ? params["promptId"] : undefined;
-      if (promptId) {
-        fencedPromptIds.add(promptId);
+      if (!promptId) {
+        return;
       }
+      if (activeTurnToken && promptId === activeTurnPromptId) {
+        // Already running: there is nothing to stop on arrival, so the fence is
+        // applied to the turn itself. Retiring the token denies any approval
+        // still in flight, including ones the adapter would auto-approve.
+        activeTurnToken.live = false;
+        cancelledSessions.add(activeTurnToken.sessionId);
+        activeChild?.kill("SIGTERM");
+        return;
+      }
+      if (fencedPromptIds.size >= MAX_FENCED_PROMPT_IDS) {
+        // Oldest first: a fence this stale describes a prompt that is never
+        // going to arrive.
+        const oldest = fencedPromptIds.values().next();
+        if (!oldest.done) {
+          fencedPromptIds.delete(oldest.value);
+        }
+      }
+      fencedPromptIds.add(promptId);
       return;
     }
     case "session/cancel": {

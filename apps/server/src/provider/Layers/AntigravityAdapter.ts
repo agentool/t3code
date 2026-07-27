@@ -847,8 +847,11 @@ export function makeAntigravityAdapter(
         }).pipe(Effect.scoped),
       );
 
-    const sendTurn: AntigravityAdapterShape["sendTurn"] = (input) =>
-      Effect.gen(function* () {
+    const sendTurn: AntigravityAdapterShape["sendTurn"] = (input) => {
+      // Captured outside the workflow so the finalizer can retire the id no
+      // matter where inside it things stopped.
+      let registered: { ctx: AntigravitySessionContext; promptId: string } | undefined;
+      return Effect.gen(function* () {
         const ctx = yield* requireSession(input.threadId);
         // Claimed before any yielding preparation. Attachment resolution and id
         // generation both yield, and a Stop landing in that window would
@@ -858,6 +861,7 @@ export function makeAntigravityAdapter(
         const promptId = `${ctx.acpSessionId}-${ctx.nextPromptSeq}`;
         const acceptedEpoch = ctx.cancelEpoch;
         ctx.outstandingPromptIds.add(promptId);
+        registered = { ctx, promptId };
 
         // `agy --print` takes a single text prompt, so attachments travel as
         // `resource_link` blocks (ACP baseline, no capability needed) pointing
@@ -1099,9 +1103,6 @@ export function makeAntigravityAdapter(
         }).pipe(
           Effect.ensuring(
             Effect.gen(function* () {
-              // No longer in transit, whatever happened to it: a fence for this
-              // id would now stop nothing, and keeping it would grow the set.
-              ctx.outstandingPromptIds.delete(promptId);
               // Decrement and the last-prompt test are one synchronous step, so
               // a steer arriving mid-settlement cannot make two prompts both
               // believe they own the turn and publish a terminal event each.
@@ -1152,7 +1153,18 @@ export function makeAntigravityAdapter(
             }).pipe(Effect.catchCause(() => Effect.void)),
           ),
         );
-      });
+      }).pipe(
+        // Registered before validation and attachment work so a Stop landing
+        // during those can still fence this prompt — which means its removal
+        // has to cover them failing too. An id left behind would be re-fenced
+        // by every later Stop.
+        Effect.ensuring(
+          Effect.sync(() => {
+            registered?.ctx.outstandingPromptIds.delete(registered.promptId);
+          }),
+        ),
+      );
+    };
 
     const interruptTurn: AntigravityAdapterShape["interruptTurn"] = (threadId) =>
       Effect.gen(function* () {
@@ -1160,6 +1172,11 @@ export function makeAntigravityAdapter(
         // Recorded before anything else: prompts already accepted but still
         // queued upstream compare against this and refuse to submit.
         ctx.cancelEpoch += 1;
+        // Snapshotted in the same synchronous step as the bump. A live Set
+        // iterator yields entries added during iteration, so a prompt accepted
+        // after this cancel would be fenced by it and wrongly reported
+        // cancelled.
+        const fencedPromptIds = [...ctx.outstandingPromptIds];
         // Settled before the cancel goes out, as ACP requires: an outstanding
         // permission request has a hook process blocked behind it, and the
         // bridge turns "cancel" into a denial. Leaving it pending would hold
@@ -1177,7 +1194,7 @@ export function makeAntigravityAdapter(
         // lets the bridge recognise and stop that one. Sending it
         // unconditionally would instead fence a cancel that arrived after its
         // own turn ended, killing the next unrelated prompt.
-        for (const outstanding of ctx.outstandingPromptIds) {
+        for (const outstanding of fencedPromptIds) {
           yield* Effect.ignore(ctx.acp.notify("t3/fence", { promptId: outstanding }));
         }
         yield* Effect.ignore(
