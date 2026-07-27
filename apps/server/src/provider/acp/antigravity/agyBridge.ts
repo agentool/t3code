@@ -57,6 +57,10 @@ const DECISION_SUFFIX = ".decision";
 const APPROVAL_WAIT_MS = 10 * 60 * 1000;
 const APPROVAL_HOOK_TIMEOUT_SECONDS = 11 * 60;
 const APPROVAL_POLL_INTERVAL_MS = 50;
+/** Grace period before a cancelled process group is killed outright. */
+const KILL_ESCALATION_MS = 5_000;
+/** Secret shared with hook processes so a decision cannot be forged. */
+const HOOK_SECRET_ENV = "T3_AGY_HOOK_SECRET";
 const HOOK_POLL_INTERVAL_MS = 50;
 const DEFAULT_PRINT_TIMEOUT = "2h";
 const HOOKS_KEY = "t3code-antigravity-observer";
@@ -416,11 +420,33 @@ function decisionPath(hookDir: string, hookName: string): string {
   return NodePath.join(hookDir, `${hookName}${DECISION_SUFFIX}`);
 }
 
+/**
+ * Authenticate a decision so only this bridge can issue one.
+ *
+ * The decision is a file in a temp directory, and anything running as the user
+ * — including a tool the user has just approved — could otherwise drop an
+ * `allow` there and have every later tool wave itself through. The secret is
+ * generated per bridge process and reaches the hook through its environment,
+ * so a forged file fails the check and is treated as no decision at all.
+ */
+function signDecision(hookName: string, decision: AgyHookDecision): string {
+  // Both sides resolve the same value: the bridge holds it in memory, and the
+  // hook — a separate process — reads the copy handed to it in its
+  // environment.
+  const secret = process.env[HOOK_SECRET_ENV] || hookSecret;
+  return NodeCrypto.createHmac("sha256", secret)
+    .update(`${hookName}:${decision.decision}`)
+    .digest("hex");
+}
+
 function writeDecision(hookDir: string, hookName: string, decision: AgyHookDecision): void {
   try {
     const target = decisionPath(hookDir, hookName);
     const staging = `${target}.tmp`;
-    NodeFS.writeFileSync(staging, JSON.stringify(decision));
+    NodeFS.writeFileSync(
+      staging,
+      JSON.stringify({ ...decision, mac: signDecision(hookName, decision) }),
+    );
     NodeFS.renameSync(staging, target);
   } catch {
     // The waiting hook falls back to denying when its deadline passes, which
@@ -617,7 +643,22 @@ async function awaitDecision(hookDir: string, hookName: string): Promise<AgyHook
       const raw = NodeFS.readFileSync(target, "utf8");
       const parsed: unknown = JSON.parse(raw);
       if (isRecord(parsed) && (parsed["decision"] === "allow" || parsed["decision"] === "deny")) {
-        return parsed as unknown as AgyHookDecision;
+        const decision = { decision: parsed["decision"] } as AgyHookDecision;
+        const expected = signDecision(hookName, decision);
+        const presented = typeof parsed["mac"] === "string" ? parsed["mac"] : "";
+        // Length-checked before comparing: `timingSafeEqual` throws on a
+        // mismatch, and an unsigned file is a forgery either way.
+        if (
+          presented.length === expected.length &&
+          NodeCrypto.timingSafeEqual(Buffer.from(presented), Buffer.from(expected))
+        ) {
+          return {
+            decision: decision.decision,
+            ...(typeof parsed["reason"] === "string" ? { reason: parsed["reason"] } : {}),
+          };
+        }
+        // Unsigned or forged: ignore it and keep waiting, so a planted file
+        // cannot allow a tool and cannot short-circuit a real decision either.
       }
     } catch {
       // Not written yet, or written partially; try again.
@@ -825,7 +866,48 @@ interface TurnOutcome {
   readonly failure?: string;
 }
 
+/**
+ * Per-process secret authenticating approval decisions. Reaches hook processes
+ * through their environment and never touches disk.
+ */
+const hookSecret = NodeCrypto.randomBytes(32).toString("hex");
+
 let activeChild: NodeChildProcess.ChildProcess | null = null;
+
+/**
+ * Stop the running turn's whole process group, escalating if it lingers.
+ *
+ * Signalling only the direct child leaves anything it spawned running: a tool
+ * mid-write keeps changing the workspace after the user pressed Stop, and its
+ * output can still arrive against a turn that has been reported cancelled.
+ */
+function killActiveChild(): void {
+  const child = activeChild;
+  if (!child?.pid) {
+    return;
+  }
+  const { pid } = child;
+  const signalGroup = (signal: NodeJS.Signals) => {
+    try {
+      // Negative pid targets the group, which `detached: true` gave the child.
+      process.kill(-pid, signal);
+    } catch {
+      // Already gone, or never got a group; fall back to the child alone.
+      try {
+        child.kill(signal);
+      } catch {
+        // Nothing left to signal.
+      }
+    }
+  };
+  signalGroup("SIGTERM");
+  const escalation = setTimeout(() => {
+    if (activeChild === child && child.exitCode === null && child.signalCode === null) {
+      signalGroup("SIGKILL");
+    }
+  }, KILL_ESCALATION_MS);
+  escalation.unref?.();
+}
 /** Session whose turn is currently running, if any. Gates `session/cancel`. */
 let activeTurnSessionId: string | null = null;
 /**
@@ -1120,8 +1202,12 @@ async function runTurn(
       }),
       {
         cwd: session.cwd,
-        env: { ...process.env, [HOOK_DIR_ENV]: hookDir },
+        env: { ...process.env, [HOOK_DIR_ENV]: hookDir, [HOOK_SECRET_ENV]: hookSecret },
         stdio: ["ignore", "pipe", "pipe"],
+        // Its own process group, so cancelling can reach the tools `agy`
+        // spawned rather than only `agy` itself. A tool left running keeps
+        // modifying the workspace after Stop.
+        detached: true,
       },
     );
   } catch (error) {
@@ -1155,7 +1241,7 @@ async function runTurn(
   activeChild = child;
   // A cancel during startup had no process to signal; deliver it now.
   if (cancelledSessions.has(sessionId)) {
-    child.kill("SIGTERM");
+    killActiveChild();
   }
 
   let stdout = "";
@@ -1412,7 +1498,7 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
       ) {
         activeTurnToken.live = false;
         cancelledSessions.add(sessionId);
-        activeChild?.kill("SIGTERM");
+        killActiveChild();
       }
       return;
     }
@@ -1441,7 +1527,7 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
         // that carried an epoch is stopped only if that epoch was cancelled.
         if (activeTurnEpoch === undefined || activeTurnEpoch <= cancelledThrough(sessionId)) {
           cancelledSessions.add(sessionId);
-          activeChild?.kill("SIGTERM");
+          killActiveChild();
         }
       }
       return;
@@ -1555,6 +1641,6 @@ export async function runAgyBridge(): Promise<void> {
   // only resolves when `agy` exits, so waiting first would keep the bridge and
   // its child alive for the whole print timeout — hours — after the client
   // disconnected.
-  activeChild?.kill("SIGTERM");
+  killActiveChild();
   await queue;
 }

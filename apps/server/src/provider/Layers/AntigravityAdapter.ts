@@ -487,7 +487,15 @@ export function makeAntigravityAdapter(
             }),
           );
         }
-      }).pipe(Effect.onExit(() => cleanupContext(ctx)));
+      }).pipe(
+        // The whole sequence is uninterruptible, not just the cleanup inside
+        // it. `ctx.stopped` and the published-turn snapshot are taken first, so
+        // an interrupt partway would have the session torn down by `onExit`
+        // while the completions and `session.exited` it owed were never
+        // published — and no later stop would retry, the flag already being set.
+        Effect.uninterruptible,
+        Effect.onExit(() => cleanupContext(ctx)),
+      );
 
     const startSession: AntigravityAdapterShape["startSession"] = (input) =>
       withThreadLock(
@@ -611,8 +619,20 @@ export function makeAntigravityAdapter(
                 const permissionRequest = parsePermissionRequest(params);
                 const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
                 const decision = yield* Deferred.make<ProviderApprovalDecision>();
-                const turnId = sessions.get(input.threadId)?.activeTurnId;
                 pendingApprovals.set(requestId, { decision });
+                // Rechecked after registering, not only before: minting the id
+                // and the deferred both yield, and a Stop landing in that gap
+                // would find no entry to cancel — leaving this request open in
+                // the UI and its deferred held for the full approval timeout.
+                if (
+                  ctx?.stopped ||
+                  (approvalEpoch !== undefined &&
+                    ctx !== undefined &&
+                    approvalEpoch !== ctx.cancelEpoch)
+                ) {
+                  pendingApprovals.delete(requestId);
+                  return { outcome: { outcome: "cancelled" } as const };
+                }
                 yield* offerRuntimeEvent(
                   makeAcpRequestOpenedEvent({
                     stamp: yield* makeEventStamp(),
@@ -645,7 +665,7 @@ export function makeAntigravityAdapter(
                     stamp: yield* makeEventStamp(),
                     provider: PROVIDER,
                     threadId: input.threadId,
-                    turnId,
+                    turnId: approvalTurnId,
                     requestId: RuntimeRequestId.make(requestId),
                     permissionRequest,
                     decision: resolved,
