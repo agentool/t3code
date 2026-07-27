@@ -1408,7 +1408,14 @@ export function makeAntigravityAdapter(
         // produces arrive with no turn to belong to. Delivered this way the
         // bridge answers the original prompt itself, after its updates are on
         // the wire, and the turn settles on that response.
-        yield* Effect.ignore(ctx.acp.notify("session/cancel", { sessionId: ctx.acpSessionId }));
+        // Carries the epoch it cancels, so it is bounded to the same turns the
+        // fence covers even if the fence itself never arrived.
+        yield* Effect.ignore(
+          ctx.acp.notify("session/cancel", {
+            sessionId: ctx.acpSessionId,
+            epoch: cancelledThrough,
+          }),
+        );
         // Fallback: if the bridge never answers — wedged, or already gone — the
         // interrupt still happens, just late enough not to truncate a healthy
         // drain. Forked into the session scope so it dies with the session.

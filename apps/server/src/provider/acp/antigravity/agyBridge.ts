@@ -1157,6 +1157,21 @@ function promptEpochOf(params: Record<string, unknown>): number | undefined {
  * contributes to.
  */
 let activeTurnEpoch: number | undefined;
+/**
+ * Temp directories the running turn owns.
+ *
+ * Tracked outside `runTurn` so a signal that ends the process can still remove
+ * them: `process.exit` skips the cleanup at the end of the turn, and these hold
+ * copies of the user's attachments and file contents captured around edits.
+ */
+const activeTurnTempDirs = new Set<string>();
+
+function cleanupActiveTurnTempDirs(): void {
+  for (const dir of activeTurnTempDirs) {
+    cleanupDir(dir);
+  }
+  activeTurnTempDirs.clear();
+}
 /** Token of that turn, retired when its epoch is cancelled. */
 let activeTurnToken: TurnToken | undefined;
 
@@ -1416,9 +1431,14 @@ async function runTurn(
   let child: NodeChildProcess.ChildProcess;
   try {
     hookDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-agy-hookout-"));
+    activeTurnTempDirs.add(hookDir);
     hookWorkspace = createHookWorkspace();
+    activeTurnTempDirs.add(hookWorkspace);
     const attachments = stageAttachments(prompt.attachments);
     attachmentDir = attachments.dir;
+    if (attachmentDir) {
+      activeTurnTempDirs.add(attachmentDir);
+    }
     const command = process.env["T3_AGY_COMMAND"]?.trim() || "agy";
     child = NodeChildProcess.spawn(
       command,
@@ -1445,6 +1465,9 @@ async function runTurn(
     cleanupDir(hookDir);
     cleanupDir(hookWorkspace);
     cleanupDir(attachmentDir);
+    if (hookDir) activeTurnTempDirs.delete(hookDir);
+    if (hookWorkspace) activeTurnTempDirs.delete(hookWorkspace);
+    if (attachmentDir) activeTurnTempDirs.delete(attachmentDir);
     throw error;
   }
 
@@ -1566,6 +1589,11 @@ async function runTurn(
   cleanupDir(hookDir);
   cleanupDir(hookWorkspace);
   cleanupDir(attachmentDir);
+  activeTurnTempDirs.delete(hookDir);
+  activeTurnTempDirs.delete(hookWorkspace);
+  if (attachmentDir) {
+    activeTurnTempDirs.delete(attachmentDir);
+  }
 
   if (cancelledSessions.delete(sessionId)) {
     return { stopReason: "cancelled" };
@@ -1768,15 +1796,14 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
         // higher epoch and must survive this notification, which the runtime
         // forks and can therefore deliver late.
         //
-        // A cancel is authoritative for the turn that is running: the fence
-        // that would normally have raised the mark is a separate notification
-        // and can fail to send, and without this the child would survive a Stop
-        // the client believes it delivered.
-        if (activeTurnEpoch !== undefined) {
-          cancelledThroughEpoch.set(
-            sessionId,
-            Math.max(cancelledThrough(sessionId), activeTurnEpoch),
-          );
+        // A cancel carries the epoch it covers, so it can stand in for a fence
+        // that failed to send without reaching past its own turn. Promoting the
+        // mark to whatever happened to be running would let a late cancel kill
+        // a prompt accepted after it — the runtime forks this notification, so
+        // arriving late is normal.
+        const cancelEpoch = typeof params["epoch"] === "number" ? params["epoch"] : undefined;
+        if (cancelEpoch !== undefined) {
+          cancelledThroughEpoch.set(sessionId, Math.max(cancelledThrough(sessionId), cancelEpoch));
         }
         // Judged by the running turn's own mode, not by anything the session
         // did earlier. A turn whose prompt carried no epoch cannot be scoped by
@@ -1809,6 +1836,9 @@ export async function runAgyBridge(): Promise<void> {
   const stopChildOnExit = () => {
     shuttingDown = true;
     killActiveChild({ immediate: true });
+    // The turn's own cleanup never runs when the process is going down, and
+    // these hold copies of the user's attachments and captured file contents.
+    cleanupActiveTurnTempDirs();
     // Groups whose leader already exited are known only to their pending
     // escalation, and `process.exit` runs no timers.
     killPendingGroups();
