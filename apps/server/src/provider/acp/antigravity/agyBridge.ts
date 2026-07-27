@@ -380,6 +380,22 @@ function readHookEvents(hookDir: string, seen: Set<string>): ReadonlyArray<Obser
 
 // ── Tool approval ─────────────────────────────────────────────────────
 
+/**
+ * Identity for one `runTurn`, used to bound the lifetime of its approvals.
+ *
+ * A cancel generation alone is not enough: a hook file first read after the
+ * turn ended has no earlier generation to compare against, and a decision
+ * banked from a dead turn must not carry into the next one.
+ */
+interface TurnToken {
+  readonly sessionId: string;
+  live: boolean;
+}
+
+function turnTokenLive(token: TurnToken): boolean {
+  return token.live && !cancelledSessions.has(token.sessionId);
+}
+
 const APPROVE_OPTION = "allow";
 const APPROVE_SESSION_OPTION = "allow-session";
 const REJECT_OPTION = "reject";
@@ -430,7 +446,18 @@ function requestToolApproval(input: {
   readonly hookDir: string;
   readonly hookName: string;
   readonly payload: AgyHookPayload;
+  /** The turn that asked. Approvals are only valid while it is still running. */
+  readonly turnToken: TurnToken;
 }): void {
+  // Checked before the session-wide fast path, not after: a hook first seen
+  // after a cancel would otherwise be waved through by a blanket approval.
+  if (!turnTokenLive(input.turnToken)) {
+    writeDecision(input.hookDir, input.hookName, {
+      decision: "deny",
+      reason: "Cancelled before this tool was approved",
+    });
+    return;
+  }
   // Already approved for the whole session: answer without troubling the user.
   if (sessionWideApprovals.has(input.sessionId)) {
     writeDecision(input.hookDir, input.hookName, { decision: "allow" });
@@ -438,8 +465,7 @@ function requestToolApproval(input: {
   }
   const toolCall = input.payload.toolCall;
   const stepIdx = typeof input.payload.stepIdx === "number" ? input.payload.stepIdx : 0;
-  // An allow decided while Stop was landing must not be written as an allow.
-  const requestedAtGeneration = cancelGeneration(input.sessionId);
+
   void sendRequest(
     "session/request_permission",
     {
@@ -465,13 +491,16 @@ function requestToolApproval(input: {
     APPROVAL_WAIT_MS,
   )
     .then((result) => {
-      const decision =
-        cancelGeneration(input.sessionId) !== requestedAtGeneration
-          ? ({
-              decision: "deny",
-              reason: "Cancelled before this tool was approved",
-            } satisfies AgyHookDecision)
-          : approvalOutcomeToDecision(result, [APPROVE_OPTION, APPROVE_SESSION_OPTION]);
+      // Re-checked at the moment of answering: the turn may have ended or been
+      // cancelled while the user was deciding.
+      const decision = !turnTokenLive(input.turnToken)
+        ? ({
+            decision: "deny",
+            reason: "Cancelled before this tool was approved",
+          } satisfies AgyHookDecision)
+        : approvalOutcomeToDecision(result, [APPROVE_OPTION, APPROVE_SESSION_OPTION]);
+      // Only recorded for a still-live turn. A blanket approval banked from a
+      // turn that has already ended would silently pre-approve the next one.
       if (decision.decision === "allow" && selectedOptionId(result) === APPROVE_SESSION_OPTION) {
         sessionWideApprovals.add(input.sessionId);
       }
@@ -811,6 +840,17 @@ const cancelledSessions = new Set<string>();
  * that lands harmlessly between two turns.
  */
 const cancelGenerations = new Map<string, number>();
+/**
+ * Sessions cancelled while no turn was running.
+ *
+ * The generation check compares a prompt's enqueue-time value against its
+ * run-time value, which cannot see a cancel that landed *before* the prompt
+ * arrived — the prompt simply reads the post-cancel value and matches. The
+ * runtime forks its cancel notification, so that ordering is real. This
+ * one-shot marker is consumed by the next prompt for the session, which then
+ * refuses to start.
+ */
+const pendingCancelMarkers = new Set<string>();
 /** Cancel generation captured when each queued prompt was accepted, by JSON-RPC id. */
 const queuedPromptGenerations = new Map<unknown, number>();
 
@@ -833,6 +873,7 @@ function drain(input: {
   readonly decoder: NodeStringDecoder.StringDecoder;
   readonly transcriptOffset: { value: number };
   readonly assistantText: { emitted: boolean };
+  readonly turnToken: TurnToken;
   readonly final: boolean;
 }): void {
   for (const { name, event: hook } of readHookEvents(input.hookDir, input.seenHooks)) {
@@ -877,6 +918,7 @@ function drain(input: {
           hookDir: input.hookDir,
           hookName: name,
           payload: hook.payload,
+          turnToken: input.turnToken,
         });
       }
     }
@@ -1015,6 +1057,9 @@ async function runTurn(
 ): Promise<TurnOutcome> {
   // A cancel that raced the end of an earlier turn must not decide this one.
   cancelledSessions.delete(sessionId);
+  // This turn was allowed to start, so no in-transit cancel is outstanding for
+  // it; leaving the marker would stop an unrelated later prompt.
+  pendingCancelMarkers.delete(sessionId);
   // Claimed before any setup work: spawning `agy` takes long enough that a
   // cancel can land first, and cancels are only honoured for the session
   // holding this claim. Leaving it unset until after the spawn would silently
@@ -1070,6 +1115,7 @@ async function runTurn(
     state.resolvedTranscriptPath = baseline.path;
   }
   const assistantText = { emitted: false };
+  const turnToken: TurnToken = { sessionId, live: true };
   activeChild = child;
   // A cancel during startup had no process to signal; deliver it now.
   if (cancelledSessions.has(sessionId)) {
@@ -1097,6 +1143,7 @@ async function runTurn(
       decoder,
       transcriptOffset,
       assistantText,
+      turnToken,
       final: false,
     });
   }, HOOK_POLL_INTERVAL_MS);
@@ -1118,6 +1165,7 @@ async function runTurn(
     decoder,
     transcriptOffset,
     assistantText,
+    turnToken,
     final: true,
   });
 
@@ -1140,6 +1188,10 @@ async function runTurn(
     persistConversationId(sessionId, state.conversationId);
   }
 
+  // Retired before the directories are reclaimed: any approval still in flight
+  // now resolves to a denial rather than writing into a vanishing directory or
+  // banking a blanket approval for the next turn.
+  turnToken.live = false;
   cleanupDir(hookDir);
   cleanupDir(hookWorkspace);
   cleanupDir(attachmentDir);
@@ -1265,7 +1317,13 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
       }
       const queuedAt = queuedPromptGenerations.get(id);
       queuedPromptGenerations.delete(id);
-      if (queuedAt !== undefined && queuedAt !== cancelGeneration(sessionId)) {
+      // Consumed here, so exactly one prompt is stopped by a cancel that
+      // outran it; anything the user sends afterwards runs normally.
+      const cancelledInTransit = pendingCancelMarkers.delete(sessionId);
+      if (
+        cancelledInTransit ||
+        (queuedAt !== undefined && queuedAt !== cancelGeneration(sessionId))
+      ) {
         // Cancelled while it sat in the queue; never spawn `agy` for it.
         sendResult(id, { stopReason: "cancelled" });
         return;
@@ -1289,6 +1347,10 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
         // Always recorded, so prompts already queued for this session can see
         // that a cancel happened and refuse to start.
         cancelGenerations.set(sessionId, cancelGeneration(sessionId) + 1);
+        if (sessionId !== activeTurnSessionId) {
+          // No turn to interrupt, so this cancel is for one still in transit.
+          pendingCancelMarkers.add(sessionId);
+        }
         // Only a cancel aimed at the turn actually running decides its stop
         // reason. Cancels bypass the request queue, so one arriving after a
         // turn finished — or targeting an idle session — must not sit in the
