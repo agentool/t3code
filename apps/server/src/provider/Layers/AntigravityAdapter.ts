@@ -84,11 +84,13 @@ const PROVIDER = ProviderDriverKind.make("antigravity");
 /**
  * How long this side waits for a tool-approval answer.
  *
- * Deliberately longer than the bridge's own wait: the bridge denies first and
- * the blocked hook is released by that, so this only exists to stop an
- * unanswered request pinning its entry and its UI prompt forever.
+ * Deliberately *shorter* than the bridge's own wait, which is shorter again
+ * than the hook's. Each layer must give up before the one behind it: when this
+ * was the longest, the bridge had already denied and released the hook while
+ * the request was still open here, so a user answering in that window got an
+ * acceptance the bridge would ignore.
  */
-const APPROVAL_WAIT_MS = 11 * 60 * 1000;
+const APPROVAL_WAIT_MS = 9 * 60 * 1000;
 /**
  * How long to let the bridge answer a cancelled prompt on its own before
  * interrupting the RPC. Only a backstop against a wedged bridge; the normal
@@ -1241,7 +1243,6 @@ export function makeAntigravityAdapter(
                       // prompt that published `turn.started` may not be the one that
                       // settles the turn, and the settler still owes the completion.
                       const published = ctx.publishedTurnIds.has(turnId);
-                      ctx.publishedTurnIds.delete(turnId);
                       ctx.reservedTurnIds.delete(turnId);
                       // The public session field is what `listSessions` and the reaper
                       // read, so leaving it set would advertise a turn that has ended.
@@ -1258,22 +1259,33 @@ export function makeAntigravityAdapter(
                       // renders as running forever even though sendTurn already
                       // returned an error.
                       if (!published) {
+                        ctx.publishedTurnIds.delete(turnId);
                         return;
                       }
-                      const state =
+                      const state: "cancelled" | "completed" | "failed" =
                         stopReason === "cancelled"
                           ? "cancelled"
                           : promptSucceeded
                             ? "completed"
                             : "failed";
-                      yield* offerRuntimeEvent({
-                        type: "turn.completed",
+                      // The claim is surrendered only once the event is built
+                      // and published. Releasing it first meant a failure while
+                      // stamping — which mints a UUID — left teardown seeing no
+                      // published turn, so nothing ever reported the turn ending.
+                      const completedEvent = {
+                        type: "turn.completed" as const,
                         ...(yield* makeEventStamp()),
                         provider: PROVIDER,
                         threadId: input.threadId,
                         turnId,
                         payload: { state, stopReason },
-                      });
+                      };
+                      yield* Effect.uninterruptible(
+                        Effect.gen(function* () {
+                          yield* offerRuntimeEvent(completedEvent);
+                          ctx.publishedTurnIds.delete(turnId);
+                        }),
+                      );
                       // `catchCause` rather than `catch`: a defect while stamping or
                       // publishing would otherwise escape after the turn's prompt count
                       // was already decremented, stranding the turn as running.
@@ -1349,7 +1361,15 @@ export function makeAntigravityAdapter(
           yield* Effect.forkIn(
             Effect.sleep(CANCEL_ACK_TIMEOUT_MS).pipe(
               Effect.flatMap(() =>
-                ctx.activeTurnId === cancelledTurnId ? Effect.ignore(ctx.acp.cancel) : Effect.void,
+                ctx.activeTurnId !== cancelledTurnId
+                  ? Effect.void
+                  : // Still running this long after a cancel means the bridge is
+                    // not processing notifications. Interrupting the RPC alone
+                    // would settle the turn here while a detached `agy` kept
+                    // running tools, so the session goes instead: closing its
+                    // scope ends the bridge process, whose own exit handler
+                    // kills the `agy` process group.
+                    Effect.ignore(stopSessionInternal(ctx)),
               ),
             ),
             ctx.scope,
