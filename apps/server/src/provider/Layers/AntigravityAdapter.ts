@@ -188,6 +188,15 @@ interface AntigravitySessionContext {
   /** Cancel epoch the active turn belongs to; steering is scoped to it. */
   activeTurnEpoch: number;
   /**
+   * Turns whose prompt the bridge has not answered yet.
+   *
+   * The cancel fallback arms on this rather than on "is that turn still
+   * active": a turn stays active while its events drain, and a healthy drain
+   * can outlast the acknowledgement window — which would have the fallback
+   * tear down a session that is working perfectly.
+   */
+  readonly awaitingBridgeAck: Set<TurnId>;
+  /**
    * Number of prompts in flight. >0 means a turn is running, so a new
    * sendTurn steers the existing turn rather than opening a new one.
    */
@@ -432,8 +441,12 @@ export function makeAntigravityAdapter(
        * in the meantime would take its replacement down with it.
        */
       onlyIfActiveTurn?: TurnId,
-    ) =>
-      Effect.gen(function* () {
+    ) => {
+      // Whether this call is the one that claimed the teardown. The cleanup
+      // below must not run otherwise: a call that declined because the turn had
+      // moved on would close a session that is perfectly alive.
+      let claimedTeardown = false;
+      return Effect.gen(function* () {
         // Claiming the stop, snapshotting what was published, and clearing the
         // active turn happen under the lifecycle gate so they cannot interleave
         // with a `sendTurn` that is midway through announcing its turn.
@@ -446,6 +459,7 @@ export function makeAntigravityAdapter(
               return undefined;
             }
             ctx.stopped = true;
+            claimedTeardown = true;
             const claimed = [...ctx.publishedTurnIds];
             ctx.publishedTurnIds.clear();
             ctx.reservedTurnIds.clear();
@@ -517,8 +531,13 @@ export function makeAntigravityAdapter(
         // while the completions and `session.exited` it owed were never
         // published — and no later stop would retry, the flag already being set.
         Effect.uninterruptible,
-        Effect.onExit(() => cleanupContext(ctx)),
+        // Only for the call that claimed the teardown. Running it regardless
+        // meant a declined call — the fallback finding its turn already gone —
+        // closed and deregistered a live session without so much as a
+        // `session.exited`.
+        Effect.onExit(() => (claimedTeardown ? cleanupContext(ctx) : Effect.void)),
       );
+    };
 
     const startSession: AntigravityAdapterShape["startSession"] = (input) =>
       withThreadLock(
@@ -818,6 +837,7 @@ export function makeAntigravityAdapter(
             approvals: pendingApprovals,
             acpSessionId: started.sessionId,
             activeTurnEpoch: -1,
+            awaitingBridgeAck: new Set(),
             stopped: false,
           };
 
@@ -1192,11 +1212,18 @@ export function makeAntigravityAdapter(
                 const drain = Effect.ignore(
                   Effect.raceFirst(ctx.acp.drainEvents, Deferred.await(ctx.teardownSignal)),
                 );
+                ctx.awaitingBridgeAck.add(turnId);
                 return yield* ctx.acp
                   .prompt({ prompt: promptParts, _meta: { t3: { epoch: acceptedEpoch } } })
                   .pipe(
+                    // Cleared the moment the bridge answers, before draining:
+                    // the drain is the part that can legitimately run long, and
+                    // the fallback must not read that as an unresponsive bridge.
+                    Effect.tapCause(() => Effect.sync(() => ctx.awaitingBridgeAck.delete(turnId))),
+                    Effect.tap(() => Effect.sync(() => ctx.awaitingBridgeAck.delete(turnId))),
                     Effect.tapCause(() => drain),
                     Effect.tap(() => drain),
+                    Effect.ensuring(Effect.sync(() => ctx.awaitingBridgeAck.delete(turnId))),
                   );
               }).pipe(
                 Effect.mapError((error) =>
@@ -1384,7 +1411,9 @@ export function makeAntigravityAdapter(
                 // ten seconds late, and the check has to happen under the same
                 // gate that claims the stop or a turn that settled meanwhile
                 // takes its replacement down with it.
-                Effect.ignore(stopSessionInternal(ctx, cancelledTurnId)),
+                ctx.awaitingBridgeAck.has(cancelledTurnId)
+                  ? Effect.ignore(stopSessionInternal(ctx, cancelledTurnId))
+                  : Effect.void,
               ),
             ),
             ctx.scope,

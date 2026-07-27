@@ -960,6 +960,28 @@ let activeChild: NodeChildProcess.ChildProcess | null = null;
  * mid-write keeps changing the workspace after the user pressed Stop, and its
  * output can still arrive against a turn that has been reported cancelled.
  */
+/**
+ * Process groups signalled but not yet confirmed dead.
+ *
+ * `agy` can exit on SIGTERM while a tool it started ignores the signal, and
+ * `runTurn` then clears `activeChild`. Only the pending escalation still knew
+ * that group existed — and a shutdown inside that window runs no timers, so the
+ * tool survived with nothing left to stop it.
+ */
+const pendingKillGroups = new Set<number>();
+
+/** SIGKILL every group still awaiting escalation. Used on shutdown. */
+function killPendingGroups(): void {
+  for (const pid of pendingKillGroups) {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  }
+  pendingKillGroups.clear();
+}
+
 function killActiveChild(options?: { readonly immediate?: boolean }): void {
   const child = activeChild;
   if (!child?.pid) {
@@ -996,15 +1018,18 @@ function killActiveChild(options?: { readonly immediate?: boolean }): void {
   };
   if (options?.immediate) {
     signalGroup("SIGKILL");
+    pendingKillGroups.delete(pid);
     return;
   }
   signalGroup("SIGTERM");
+  pendingKillGroups.add(pid);
   // Escalation does not depend on the leader still being alive. `agy` can exit
   // on SIGTERM while a tool it started ignores the signal and keeps the group —
   // and the workspace — busy; signalling a group that has genuinely gone is
   // harmless, the error is caught above.
   const escalation = setTimeout(() => {
     signalGroup("SIGKILL");
+    pendingKillGroups.delete(pid);
   }, KILL_ESCALATION_MS);
   escalation.unref?.();
 }
@@ -1659,6 +1684,9 @@ export async function runAgyBridge(): Promise<void> {
   const stopChildOnExit = () => {
     shuttingDown = true;
     killActiveChild({ immediate: true });
+    // Groups whose leader already exited are known only to their pending
+    // escalation, and `process.exit` runs no timers.
+    killPendingGroups();
   };
   process.once("SIGTERM", () => {
     stopChildOnExit();
