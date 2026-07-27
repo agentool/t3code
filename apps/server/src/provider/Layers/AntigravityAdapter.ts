@@ -657,22 +657,28 @@ export function makeAntigravityAdapter(
                   pendingApprovals.delete(requestId);
                   return { outcome: { outcome: "cancelled" } as const };
                 }
-                yield* offerRuntimeEvent(
-                  makeAcpRequestOpenedEvent({
-                    stamp: yield* makeEventStamp(),
-                    provider: PROVIDER,
-                    threadId: input.threadId,
-                    turnId: approvalTurnId,
-                    requestId: RuntimeRequestId.make(requestId),
-                    permissionRequest,
-                    detail: permissionRequest.detail ?? "Antigravity tool call",
-                    args: params,
-                    source: "acp.jsonrpc",
-                    method: "session/request_permission",
-                    rawPayload: params,
+                // Built first, then published and recorded in one uninterruptible
+                // step. An interrupt between the two would leave the UI showing
+                // a request the finalizer does not know to close.
+                const openedEvent = makeAcpRequestOpenedEvent({
+                  stamp: yield* makeEventStamp(),
+                  provider: PROVIDER,
+                  threadId: input.threadId,
+                  turnId: approvalTurnId,
+                  requestId: RuntimeRequestId.make(requestId),
+                  permissionRequest,
+                  detail: permissionRequest.detail ?? "Antigravity tool call",
+                  args: params,
+                  source: "acp.jsonrpc",
+                  method: "session/request_permission",
+                  rawPayload: params,
+                });
+                yield* Effect.uninterruptible(
+                  Effect.gen(function* () {
+                    yield* offerRuntimeEvent(openedEvent);
+                    opened = { requestId, permissionRequest, turnId: approvalTurnId };
                   }),
                 );
-                opened = { requestId, permissionRequest, turnId: approvalTurnId };
                 // Raced against a deadline and cleaned up unconditionally: the
                 // bridge forgets its side of a timed-out request, so without
                 // this the handler would stay blocked and the entry retained.
@@ -684,18 +690,24 @@ export function makeAntigravityAdapter(
                 const resolved: ProviderApprovalDecision = Option.isSome(answered)
                   ? answered.value
                   : "cancel";
-                yield* offerRuntimeEvent(
-                  makeAcpRequestResolvedEvent({
-                    stamp: yield* makeEventStamp(),
-                    provider: PROVIDER,
-                    threadId: input.threadId,
-                    turnId: approvalTurnId,
-                    requestId: RuntimeRequestId.make(requestId),
-                    permissionRequest,
-                    decision: resolved,
+                // Same pairing on the way out: an interrupt between publishing
+                // this and recording it would have the finalizer publish a
+                // second, contradictory resolution.
+                const resolvedEvent = makeAcpRequestResolvedEvent({
+                  stamp: yield* makeEventStamp(),
+                  provider: PROVIDER,
+                  threadId: input.threadId,
+                  turnId: approvalTurnId,
+                  requestId: RuntimeRequestId.make(requestId),
+                  permissionRequest,
+                  decision: resolved,
+                });
+                yield* Effect.uninterruptible(
+                  Effect.gen(function* () {
+                    yield* offerRuntimeEvent(resolvedEvent);
+                    resolutionPublished = true;
                   }),
                 );
-                resolutionPublished = true;
                 // Re-checked at the moment of answering: an approval decided
                 // while Stop was landing must not come back as an allow.
                 const stillLive =
