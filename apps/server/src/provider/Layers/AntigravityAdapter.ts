@@ -174,6 +174,8 @@ interface AntigravitySessionContext {
    * session's before clearing the registry entry.
    */
   readonly approvals: Map<ApprovalRequestId, PendingApproval>;
+  /** Bridge-side session id, needed to address provider-specific notifications. */
+  readonly acpSessionId: string;
   /**
    * Number of prompts in flight. >0 means a turn is running, so a new
    * sendTurn steers the existing turn rather than opening a new one.
@@ -208,6 +210,12 @@ function resolveEffortSelection(
   const raw = options?.find((option) => option.id === "effort")?.value;
   const effort = typeof raw === "string" ? raw.trim().toLowerCase() : undefined;
   return effort === "low" || effort === "medium" || effort === "high" ? effort : undefined;
+}
+
+/** A thread's lock plus how many callers currently want it. */
+interface ThreadLock {
+  readonly semaphore: Semaphore.Semaphore;
+  holders: number;
 }
 
 interface PendingApproval {
@@ -262,7 +270,7 @@ export function makeAntigravityAdapter(
      * exists, and `respondToRequest` resolves entries from a different call.
      */
     const approvalsByThread = new Map<ThreadId, Map<ApprovalRequestId, PendingApproval>>();
-    const threadLocksRef = yield* SynchronizedRef.make(new Map<string, Semaphore.Semaphore>());
+    const threadLocksRef = yield* SynchronizedRef.make(new Map<string, ThreadLock>());
     const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
 
     const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -293,26 +301,51 @@ export function makeAntigravityAdapter(
     const offerRuntimeEvent = (event: ProviderRuntimeEvent) =>
       PubSub.publish(runtimeEventPubSub, event).pipe(Effect.asVoid);
 
+    /**
+     * Acquire this thread's lock, counting holders so the entry can be dropped
+     * once the last one leaves. Threads come and go for the life of the
+     * adapter — and a `stopSession` for an id that never existed still mints a
+     * lock — so an unreleased entry per id would grow without bound.
+     */
     const getThreadSemaphore = (threadId: string) =>
       SynchronizedRef.modifyEffect(threadLocksRef, (current) => {
-        const existing: Option.Option<Semaphore.Semaphore> = Option.fromNullishOr(
-          current.get(threadId),
-        );
+        const existing: Option.Option<ThreadLock> = Option.fromNullishOr(current.get(threadId));
         return Option.match(existing, {
           onNone: () =>
             Semaphore.make(1).pipe(
               Effect.map((semaphore) => {
+                const lock: ThreadLock = { semaphore, holders: 1 };
                 const next = new Map(current);
-                next.set(threadId, semaphore);
-                return [semaphore, next] as const;
+                next.set(threadId, lock);
+                return [lock, next] as const;
               }),
             ),
-          onSome: (semaphore) => Effect.succeed([semaphore, current] as const),
+          onSome: (lock) => {
+            lock.holders += 1;
+            return Effect.succeed([lock, current] as const);
+          },
         });
       });
 
+    const releaseThreadSemaphore = (threadId: string) =>
+      SynchronizedRef.update(threadLocksRef, (current) => {
+        const lock = current.get(threadId);
+        if (!lock) {
+          return current;
+        }
+        lock.holders -= 1;
+        if (lock.holders > 0) {
+          return current;
+        }
+        const next = new Map(current);
+        next.delete(threadId);
+        return next;
+      });
+
     const withThreadLock = <A, E, R>(threadId: string, effect: Effect.Effect<A, E, R>) =>
-      Effect.flatMap(getThreadSemaphore(threadId), (semaphore) => semaphore.withPermit(effect));
+      Effect.flatMap(getThreadSemaphore(threadId), (lock) =>
+        lock.semaphore.withPermit(effect).pipe(Effect.ensuring(releaseThreadSemaphore(threadId))),
+      );
 
     const logNative = (threadId: ThreadId, method: string, payload: unknown) =>
       Effect.gen(function* () {
@@ -653,6 +686,7 @@ export function makeAntigravityAdapter(
             lifecycleGate: yield* Semaphore.make(1),
             teardownSignal: yield* Deferred.make<void>(),
             approvals: pendingApprovals,
+            acpSessionId: started.sessionId,
             promptsInFlight: 0,
             stopped: false,
           };
@@ -740,6 +774,12 @@ export function makeAntigravityAdapter(
             Effect.catch((cause) =>
               Effect.logError("Failed to process Antigravity runtime notification.", { cause }),
             ),
+            // However this consumer ends — teardown, a defect while stamping,
+            // an interrupt — it fires the same signal drains wait on. Without
+            // it a consumer that died on its own would leave every later drain
+            // queuing a barrier nobody can acknowledge, hanging `sendTurn`
+            // while it holds the prompt gate.
+            Effect.onExit(() => Effect.ignore(Deferred.succeed(ctx.teardownSignal, undefined))),
             Effect.forkChild,
           );
 
@@ -1098,6 +1138,15 @@ export function makeAntigravityAdapter(
             yield* Effect.ignore(Deferred.succeed(approval.decision, "cancel"));
           }
           pending.clear();
+        }
+        // Fenced before cancelling, and only with a prompt outstanding. The
+        // runtime forks its cancel notification, so a prompt written just
+        // before this can still reach the bridge afterwards; the fence is what
+        // lets the bridge recognise and stop that one. Sending it
+        // unconditionally would instead fence a cancel that arrived after its
+        // own turn ended, killing the next unrelated prompt.
+        if (ctx.promptsInFlight > 0) {
+          yield* Effect.ignore(ctx.acp.notify("t3/fence", { sessionId: ctx.acpSessionId }));
         }
         yield* Effect.ignore(
           ctx.acp.cancel.pipe(

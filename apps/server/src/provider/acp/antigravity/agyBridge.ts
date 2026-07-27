@@ -841,14 +841,18 @@ const cancelledSessions = new Set<string>();
  */
 const cancelGenerations = new Map<string, number>();
 /**
- * Sessions cancelled while no turn was running.
+ * Sessions with a prompt the client has cancelled but which has not arrived.
  *
  * The generation check compares a prompt's enqueue-time value against its
  * run-time value, which cannot see a cancel that landed *before* the prompt
- * arrived — the prompt simply reads the post-cancel value and matches. The
- * runtime forks its cancel notification, so that ordering is real. This
- * one-shot marker is consumed by the next prompt for the session, which then
- * refuses to start.
+ * arrived — the prompt simply reads the post-cancel value and matches, and the
+ * runtime forks its cancel notification, so that ordering is real.
+ *
+ * Set only by the explicit `t3/fence` notification, which the adapter sends —
+ * and awaits — before cancelling, and only when it actually has a prompt
+ * outstanding. Inferring it from "no turn is running" instead would fence a
+ * cancel that merely arrived after its own turn finished, killing the next
+ * unrelated prompt.
  */
 const pendingCancelMarkers = new Set<string>();
 /** Cancel generation captured when each queued prompt was accepted, by JSON-RPC id. */
@@ -1309,14 +1313,17 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
       return;
     }
     case "session/prompt": {
+      // Read and cleared before the session is validated: an unknown session
+      // returns early below, and leaving the entry behind would grow this map
+      // for every bad id a client sends.
+      const queuedAt = queuedPromptGenerations.get(id);
+      queuedPromptGenerations.delete(id);
       const sessionId = typeof params["sessionId"] === "string" ? params["sessionId"] : undefined;
       const session = sessionId ? sessions.get(sessionId) : undefined;
       if (!sessionId || !session) {
         sendError(id, -32602, "unknown sessionId");
         return;
       }
-      const queuedAt = queuedPromptGenerations.get(id);
-      queuedPromptGenerations.delete(id);
       // Consumed here, so exactly one prompt is stopped by a cancel that
       // outran it; anything the user sends afterwards runs normally.
       const cancelledInTransit = pendingCancelMarkers.delete(sessionId);
@@ -1341,16 +1348,22 @@ async function handleRequest(message: Record<string, unknown>): Promise<void> {
       sendResult(id, { stopReason: outcome.stopReason });
       return;
     }
+    // Sent by the adapter immediately before it cancels, and only while it has
+    // a prompt outstanding. Notifications carry no id, so nothing is replied.
+    case "t3/fence": {
+      const sessionId = typeof params["sessionId"] === "string" ? params["sessionId"] : undefined;
+      if (sessionId && sessions.has(sessionId)) {
+        pendingCancelMarkers.add(sessionId);
+      }
+      return;
+    }
     case "session/cancel": {
       const sessionId = typeof params["sessionId"] === "string" ? params["sessionId"] : undefined;
-      if (sessionId) {
+      if (sessionId && sessions.has(sessionId)) {
         // Always recorded, so prompts already queued for this session can see
         // that a cancel happened and refuse to start.
         cancelGenerations.set(sessionId, cancelGeneration(sessionId) + 1);
-        if (sessionId !== activeTurnSessionId) {
-          // No turn to interrupt, so this cancel is for one still in transit.
-          pendingCancelMarkers.add(sessionId);
-        }
+
         // Only a cancel aimed at the turn actually running decides its stop
         // reason. Cancels bypass the request queue, so one arriving after a
         // turn finished — or targeting an idle session — must not sit in the
@@ -1419,7 +1432,7 @@ export async function runAgyBridge(): Promise<void> {
       // exactly the window a cancel has to arrive in while this prompt waits.
       if (pending["method"] === "session/prompt") {
         const target = (pending["params"] as Record<string, unknown> | undefined)?.["sessionId"];
-        if (typeof target === "string" && pending["id"] !== undefined) {
+        if (typeof target === "string" && pending["id"] !== undefined && sessions.has(target)) {
           queuedPromptGenerations.set(pending["id"], cancelGeneration(target));
         }
       }
