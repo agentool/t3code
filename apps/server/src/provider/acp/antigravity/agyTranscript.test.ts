@@ -271,6 +271,33 @@ describe("AgyTranscriptCursor", () => {
     expect(cursor.flush()).toEqual([]);
   });
 
+  it("keeps retained records out of the abandoned record's path", () => {
+    // Retained lines used to be prepended to the carry, which put finished
+    // records in the same buffer as a half-written one: the first retained line
+    // was then consumed as the abandoned record's tail and the real fragment
+    // emitted in its place.
+    const cursor = new AgyTranscriptCursor();
+    cursor.push("x".repeat(MAX_TRANSCRIPT_LINE_CHARS + 1));
+    cursor.retain(['{"legit":1}']);
+
+    expect(cursor.push('tail-of-abandoned\n{"next":2}\n')).toEqual(['{"legit":1}', '{"next":2}']);
+  });
+
+  it("still owes retained records at EOF", () => {
+    const cursor = new AgyTranscriptCursor();
+    cursor.retain(['{"held":1}']);
+
+    expect(cursor.flush()).toEqual(['{"held":1}']);
+    expect(cursor.flush()).toEqual([]);
+  });
+
+  it("counts retained records against the caller's budget", () => {
+    const cursor = new AgyTranscriptCursor();
+    cursor.retain(['{"a":1}', '{"b":2}']);
+
+    expect(cursor.carryLength).toBe('{"a":1}'.length + 1 + '{"b":2}'.length + 1);
+  });
+
   it("keeps counting consumed bytes across an abandoned record", () => {
     // The offset is what the next read starts from, so dropping content must
     // not desynchronise it from the file.

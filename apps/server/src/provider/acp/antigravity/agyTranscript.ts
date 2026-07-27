@@ -217,14 +217,23 @@ export class AgyTranscriptCursor {
    * newline rather than surfacing as a fragment that parses as nothing.
    */
   private discarding = false;
+  /**
+   * Whole lines handed back by {@link retain}, kept apart from {@link carry}.
+   *
+   * They were once prepended to the carry, which put finished records into the
+   * same buffer as a half-written one: retaining while a record was being
+   * abandoned made the first retained line look like that record's tail, so it
+   * was dropped and the real fragment emitted in its place.
+   */
+  private retained: Array<string> = [];
 
   get bytesConsumed(): number {
     return this.offset;
   }
 
-  /** Size of the held-back partial line, for callers enforcing their own budget. */
+  /** Size of everything held back, for callers enforcing their own budget. */
   get carryLength(): number {
-    return this.carry.length;
+    return this.retained.reduce((total, line) => total + line.length + 1, this.carry.length);
   }
 
   /**
@@ -256,6 +265,15 @@ export class AgyTranscriptCursor {
       this.carry = "";
       this.discarding = true;
     }
+
+    // Retained lines go back in front, where they were read from, and are not
+    // subject to the discard above — they are complete records that have
+    // already been through it once.
+    if (this.retained.length > 0) {
+      const restored = this.retained;
+      this.retained = [];
+      return [...restored, ...completed];
+    }
     return completed;
   }
 
@@ -267,18 +285,24 @@ export class AgyTranscriptCursor {
    * are re-examined against the next read rather than emitted or discarded.
    */
   retain(lines: ReadonlyArray<string>): void {
-    this.carry = lines.length > 0 ? `${lines.join("\n")}\n${this.carry}` : this.carry;
+    if (lines.length > 0) {
+      this.retained.push(...lines);
+    }
   }
 
   /** Flush the trailing line once the writer is known to be finished. */
   flush(): ReadonlyArray<string> {
     const remaining = this.carry;
     this.carry = "";
+    // Retained records are whole and still owed to the caller even at EOF.
+    const restored = this.retained;
+    this.retained = [];
     if (this.discarding) {
-      // Whatever is left is the tail of an abandoned record, not a record.
+      // Whatever is left of the carry is the tail of an abandoned record, not a
+      // record. The retained lines are unaffected.
       this.discarding = false;
-      return [];
+      return restored;
     }
-    return remaining.trim().length > 0 ? [remaining] : [];
+    return remaining.trim().length > 0 ? [...restored, remaining] : restored;
   }
 }
