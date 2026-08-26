@@ -553,6 +553,8 @@ export const DesktopPreviewFaviconSchema: Schema.Codec<DesktopPreviewFavicon> = 
 
 export interface DesktopPreviewTabState {
   tabId: string;
+  /** Browser implementation that owns this tab. Defaults to embedded when absent. */
+  backend?: "embedded" | "external-local";
   webContentsId: number | null;
   navStatus: DesktopPreviewNavStatus;
   canGoBack: boolean;
@@ -607,6 +609,7 @@ export const DesktopPreviewNavStatusSchema = Schema.Union([
 
 export const DesktopPreviewTabStateSchema: Schema.Codec<DesktopPreviewTabState> = Schema.Struct({
   tabId: DesktopPreviewTabIdSchema,
+  backend: Schema.optionalKey(Schema.Literals(["embedded", "external-local"])),
   webContentsId: Schema.NullOr(Schema.Int),
   navStatus: DesktopPreviewNavStatusSchema,
   canGoBack: Schema.Boolean,
@@ -647,6 +650,10 @@ export const DesktopPreviewPointerEventSchema: Schema.Codec<DesktopPreviewPointe
  * can attach.
  */
 export interface DesktopPreviewWebviewConfig {
+  /** Omitted by older Desktop builds, where embedded is the only backend. */
+  backend?: "embedded" | "external-local";
+  /** Human-readable browser name when backend is external-local. */
+  browserName?: string;
   /** `persist:t3code-preview` (or whatever the desktop chose). */
   partition: string;
   /**
@@ -665,6 +672,8 @@ export interface DesktopPreviewWebviewConfig {
 
 export const DesktopPreviewWebviewConfigSchema: Schema.Codec<DesktopPreviewWebviewConfig> =
   Schema.Struct({
+    backend: Schema.optionalKey(Schema.Literals(["embedded", "external-local"])),
+    browserName: Schema.optionalKey(Schema.String),
     partition: Schema.String,
     webPreferences: Schema.String,
     preloadUrl: Schema.NullOr(Schema.String),
@@ -1176,11 +1185,13 @@ export interface DesktopPreviewBridge {
    * allowed; it simply takes effect once the page plays something.
    */
   setAudioMuted: (tabId: string, audioMuted: boolean) => Promise<void>;
-  /** Open the guest webview's DevTools (detached). */
+  /** Open DevTools for the controlled preview page. */
   openDevTools: (tabId: string) => Promise<void>;
-  /** Drop cookies + storage data for the preview partition (all tabs). */
+  /** Bring the controlled browser page and its window to the foreground. */
+  focusBrowser?: (tabId: string) => Promise<void>;
+  /** Drop cookies + storage data for the active preview backend (all tabs). */
   clearCookies: () => Promise<void>;
-  /** Drop the HTTP cache for the preview partition (all tabs). */
+  /** Drop the HTTP cache for the active preview backend (all tabs). */
   clearCache: () => Promise<void>;
   /**
    * One-shot config for mounting a preview `<webview>`. Replaces three

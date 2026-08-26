@@ -28,6 +28,13 @@ function state(navStatus: DesktopPreviewTabState["navStatus"]): DesktopPreviewTa
 }
 
 describe("projectDesktopState", () => {
+  it("projects the backend and preserves embedded compatibility", () => {
+    expect(projectDesktopState(state({ kind: "Idle" })).backend).toBe("embedded");
+    expect(
+      projectDesktopState({ ...state({ kind: "Idle" }), backend: "external-local" }).backend,
+    ).toBe("external-local");
+  });
+
   it("shows a retained icon only while the current document has the captured origin", () => {
     expect(
       projectDesktopState(

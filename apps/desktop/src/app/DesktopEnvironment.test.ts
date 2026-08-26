@@ -63,6 +63,7 @@ describe("DesktopEnvironment", () => {
       assert.equal(environment.serverSettingsPath, "/tmp/t3/userdata/settings.json");
       assert.equal(environment.logDir, "/tmp/t3/userdata/logs");
       assert.equal(environment.browserArtifactsDir, "/tmp/t3/userdata/browser-artifacts");
+      assert.equal(environment.browserProfilesDir, "/tmp/t3/userdata/browser-profiles");
       assert.equal(environment.rootDir, "/repo");
       assert.equal(environment.appRoot, "/repo");
       assert.equal(environment.serverRoot, "/repo");
@@ -79,6 +80,31 @@ describe("DesktopEnvironment", () => {
       assert.deepEqual(environment.commitHashOverride, Option.some("0123456789abcdef"));
       assert.deepEqual(environment.otlpTracesUrl, Option.some("http://127.0.0.1:4318/v1/traces"));
       assert.equal(environment.otlpExportIntervalMs, 2500);
+    }),
+  );
+
+  it.effect("selects the external-local backend and typed path overrides from environment", () =>
+    Effect.gen(function* () {
+      const environment = yield* makeEnvironment(
+        {},
+        {
+          T3CODE_BROWSER_BACKEND: "external-local",
+          T3CODE_EXTERNAL_BROWSER_EXECUTABLE: " /Applications/Helium.app/Contents/MacOS/Helium ",
+          T3CODE_EXTERNAL_BROWSER_USER_DATA_DIR: " /tmp/t3-helium-profile ",
+          T3CODE_EXTERNAL_BROWSER_PROFILE_DIRECTORY: " Profile 42 ",
+        },
+      );
+
+      assert.equal(environment.browserBackend, "external-local");
+      assert.deepEqual(
+        environment.externalBrowserExecutable,
+        Option.some("/Applications/Helium.app/Contents/MacOS/Helium"),
+      );
+      assert.deepEqual(
+        environment.externalBrowserUserDataDir,
+        Option.some("/tmp/t3-helium-profile"),
+      );
+      assert.deepEqual(environment.externalBrowserProfileDirectory, Option.some("Profile 42"));
     }),
   );
 

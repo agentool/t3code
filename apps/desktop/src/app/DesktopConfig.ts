@@ -50,6 +50,12 @@ export const DesktopConfig = Config.all({
   ),
   appImagePath: trimmedString("APPIMAGE"),
   disableAutoUpdate: optionalBoolean("T3CODE_DISABLE_AUTO_UPDATE"),
+  browserBackend: Config.literals(["embedded", "external-local"], "T3CODE_BROWSER_BACKEND").pipe(
+    Config.withDefault("embedded"),
+  ),
+  externalBrowserExecutable: trimmedString("T3CODE_EXTERNAL_BROWSER_EXECUTABLE"),
+  externalBrowserUserDataDir: trimmedString("T3CODE_EXTERNAL_BROWSER_USER_DATA_DIR"),
+  externalBrowserProfileDirectory: trimmedString("T3CODE_EXTERNAL_BROWSER_PROFILE_DIRECTORY"),
   mockUpdates: optionalBoolean("T3CODE_DESKTOP_MOCK_UPDATES"),
   mockUpdateServerPort: Config.port("T3CODE_DESKTOP_MOCK_UPDATE_SERVER_PORT").pipe(
     Config.withDefault(3000),

@@ -168,6 +168,11 @@ export const openDevTools = tabMethod(
   "desktop.ipc.preview.openDevTools",
   (manager, tabId) => manager.openDevTools(tabId),
 );
+export const focusBrowser = tabMethod(
+  IpcChannels.PREVIEW_FOCUS_BROWSER_CHANNEL,
+  "desktop.ipc.preview.focusBrowser",
+  (manager, tabId) => manager.focusBrowser(tabId),
+);
 export const cancelPickElement = tabMethod(
   IpcChannels.PREVIEW_CANCEL_PICK_ELEMENT_CHANNEL,
   "desktop.ipc.preview.cancelPickElement",
@@ -220,6 +225,15 @@ export const getPreviewConfig = DesktopIpc.makeIpcMethod({
   result: DesktopPreviewWebviewConfigSchema,
   handler: Effect.fn("desktop.ipc.preview.getConfig")(function* ({ environmentId }) {
     const manager = yield* PreviewManager.PreviewManager;
+    if (manager.browserBackend === "external-local") {
+      return {
+        backend: "external-local" as const,
+        browserName: manager.browserName ?? "External browser",
+        partition: "",
+        webPreferences: "",
+        preloadUrl: null,
+      };
+    }
     yield* manager.getBrowserSession(environmentId);
     return {
       partition: yield* manager.getBrowserPartition(environmentId),
@@ -384,6 +398,7 @@ export const methods = [
   setColorScheme,
   setAudioMuted,
   openDevTools,
+  focusBrowser,
   clearCookies,
   clearCache,
   getPreviewConfig,

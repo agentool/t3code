@@ -81,6 +81,8 @@ export type PreviewNavStatus =
 
 export interface PreviewTabState {
   tabId: string;
+  /** Browser implementation that owns this tab. Omitted by legacy embedded callers. */
+  backend?: "embedded" | "external-local";
   webContentsId: number | null;
   navStatus: PreviewNavStatus;
   canGoBack: boolean;
@@ -2156,6 +2158,8 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
   const refresh = (tabId: string) => withWebContents("refresh", tabId, (wc) => wc.reload());
   const hardReload = (tabId: string) =>
     withWebContents("hardReload", tabId, (wc) => wc.reloadIgnoringCache());
+  const focusBrowser = (tabId: string) =>
+    withWebContents("focusBrowser", tabId, (wc) => wc.focus());
 
   const openDevTools = Effect.fn("PreviewManager.openDevTools")(function* (tabId: string) {
     const wc = yield* requireWebContents(tabId);
@@ -3733,6 +3737,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     goBack,
     goForward,
     hardReload,
+    focusBrowser,
     navigate,
     openPictureInPicture,
     openDevTools,
@@ -4031,6 +4036,8 @@ export const isPreviewAutomationInvalidSelectorError = Schema.is(
 export class PreviewManager extends Context.Service<
   PreviewManager,
   {
+    readonly browserBackend?: "embedded" | "external-local";
+    readonly browserName?: string | null;
     readonly setMainWindow: (window: BrowserWindow) => Effect.Effect<void, PreviewManagerError>;
     readonly getBrowserSession: (scope?: string) => Effect.Effect<Session, PreviewManagerError>;
     readonly isBrowserPartition: (partition: string) => boolean;
@@ -4054,6 +4061,7 @@ export class PreviewManager extends Context.Service<
     // Chromium inherits from the embedder when the app UI zooms.
     readonly reapplyZoom: () => Effect.Effect<void>;
     readonly hardReload: (tabId: string) => Effect.Effect<void, PreviewManagerError>;
+    readonly focusBrowser: (tabId: string) => Effect.Effect<void, PreviewManagerError>;
     readonly setColorScheme: (
       tabId: string,
       colorScheme: DesktopPreviewColorScheme,
@@ -4136,6 +4144,8 @@ export const make = Effect.gen(function* PreviewManagerMake() {
   );
 
   return PreviewManager.of({
+    browserBackend: "embedded",
+    browserName: null,
     setMainWindow: operations.setMainWindow,
     getBrowserSession: Effect.fn("PreviewManager.getBrowserSession")(function* (scope) {
       return yield* browserSession
@@ -4159,6 +4169,7 @@ export const make = Effect.gen(function* PreviewManagerMake() {
     resetZoom: operations.resetZoom,
     reapplyZoom: operations.reapplyZoom,
     hardReload: operations.hardReload,
+    focusBrowser: operations.focusBrowser,
     setColorScheme: operations.setColorScheme,
     setAudioMuted: operations.setAudioMuted,
     openDevTools: operations.openDevTools,

@@ -1,6 +1,10 @@
 "use client";
 
-import type { PreviewViewportSetting, ScopedThreadRef } from "@t3tools/contracts";
+import type {
+  DesktopPreviewWebviewConfig,
+  PreviewViewportSetting,
+  ScopedThreadRef,
+} from "@t3tools/contracts";
 import { useShallow } from "zustand/react/shallow";
 import { useCallback, useEffect, useRef, useState } from "react";
 
@@ -19,6 +23,7 @@ import { BrowserViewportResizeHandles } from "./BrowserViewportResizeHandles";
 import { acquireDesktopTab, type AcquiredDesktopTab } from "./desktopTabLifetime";
 import { resolveHostedBrowserWebviewWrapperStyle } from "./hostedBrowserWebviewStyle";
 import { usePreviewWebviewConfig } from "./previewWebviewConfigState";
+import { HostedExternalBrowser } from "./HostedExternalBrowser";
 import { useBrowserViewportResize } from "./useBrowserViewportResize";
 import {
   INITIAL_WEBVIEW_CRASH_RECOVERY_STATE,
@@ -41,16 +46,31 @@ declare global {
   }
 }
 
-export function HostedBrowserWebview(props: {
+interface HostedBrowserProps {
   readonly threadRef: ScopedThreadRef;
   readonly tabId: string;
   readonly runtimeTabId: string;
   readonly initialUrl: string | null;
   readonly viewport: PreviewViewportSetting;
   readonly zoomFactor: number;
-}) {
+}
+
+export function HostedBrowserWebview(props: HostedBrowserProps) {
+  const config = usePreviewWebviewConfig(props.threadRef.environmentId);
+  if (!config) return null;
+  if (config.backend === "external-local") {
+    return (
+      <HostedExternalBrowser {...props} browserName={config.browserName ?? "External browser"} />
+    );
+  }
+  return <EmbeddedHostedBrowserWebview {...props} config={config} />;
+}
+
+function EmbeddedHostedBrowserWebview(
+  props: HostedBrowserProps & { readonly config: DesktopPreviewWebviewConfig },
+) {
   const { threadRef, tabId, runtimeTabId, initialUrl, viewport, zoomFactor } = props;
-  const config = usePreviewWebviewConfig(threadRef.environmentId);
+  const { config } = props;
   const [initialSrc] = useState(() => initialUrl ?? "about:blank");
   const tabLeaseRef = useRef<AcquiredDesktopTab | null>(null);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
@@ -228,8 +248,6 @@ export function HostedBrowserWebview(props: {
     if (!wrapper) return;
     wrapper.scrollTo({ left: 0, top: 0 });
   }, [runtimeTabId, viewport._tag, viewportHeight, viewportWidth]);
-
-  if (!config) return null;
 
   const wrapperStyle = resolveHostedBrowserWebviewWrapperStyle({
     active,

@@ -114,6 +114,7 @@ function shouldClearBrowserPointer(
 export function projectDesktopState(state: DesktopPreviewTabState): DesktopPreviewOverlay {
   const navOrigin = state.navStatus.kind === "Idle" ? null : originOf(state.navStatus.url);
   return {
+    backend: state.backend ?? "embedded",
     hasWebContents: state.webContentsId !== null,
     canGoBack: state.canGoBack,
     canGoForward: state.canGoForward,

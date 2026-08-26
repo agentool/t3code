@@ -143,6 +143,7 @@ export function PreviewView({
   const controller = desktopOverlay?.controller ?? "none";
   const viewport = snapshot?.viewport ?? FILL_PREVIEW_VIEWPORT;
   const browserDefaults = useBrowserDefaults();
+  const externalBrowser = desktopOverlay?.backend === "external-local";
   const panelRect = useBrowserSurfaceStore((state) =>
     runtimeTabId ? (state.byTabId[runtimeTabId]?.rect ?? null) : null,
   );
@@ -673,21 +674,28 @@ export function PreviewView({
         recording={recordingRuntimeTabId !== null}
         onPictureInPicture={previewBridge && tabId ? handlePictureInPicture : undefined}
         pictureInPicture={miniPlayer?.tabId === tabId}
-        pictureInPictureDisabled={!desktopOverlay?.hasWebContents || isUnreachable}
-        onPickElement={previewBridge && tabId ? handlePickElement : undefined}
+        pictureInPictureDisabled={
+          externalBrowser || !desktopOverlay?.hasWebContents || isUnreachable
+        }
+        onPickElement={previewBridge && tabId && !externalBrowser ? handlePickElement : undefined}
         pickActive={pickActive}
         // Disable when there's no tab (nothing to pick on) OR the page
         // failed to load (a React overlay covers the webview, so the
         // user wouldn't be able to actually click anything underneath).
-        pickDisabled={!tabId || isUnreachable}
+        pickDisabled={!tabId || isUnreachable || externalBrowser}
         pickDisabledReason={
-          isUnreachable ? "Page didn't load — pick unavailable until the page renders" : undefined
+          externalBrowser
+            ? "Element picking is available in embedded browser mode"
+            : isUnreachable
+              ? "Page didn't load — pick unavailable until the page renders"
+              : undefined
         }
         trailingActions={
           previewBridge ? (
             <PreviewMoreMenu
               tabId={runtimeTabId}
               hasWebContents={desktopOverlay?.hasWebContents ?? false}
+              embeddedSurface={!externalBrowser}
               zoomFactor={desktopOverlay?.zoomFactor ?? 1}
               colorScheme={desktopOverlay?.colorScheme ?? "system"}
               deviceToolbarVisible={viewport._tag !== "fill"}

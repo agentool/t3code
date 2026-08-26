@@ -38,6 +38,8 @@ interface Props {
    * then; we disable those items so the menu doesn't fire silent no-ops.
    */
   hasWebContents: boolean;
+  /** Whether Electron-webview-only controls should be enabled. */
+  embeddedSurface: boolean;
   /** Current zoom factor as a number (1.0 = 100%). */
   zoomFactor: number;
   /** Emulated `prefers-color-scheme` for the guest page. */
@@ -60,6 +62,7 @@ interface Props {
 export function PreviewMoreMenu({
   tabId,
   hasWebContents,
+  embeddedSurface,
   zoomFactor,
   colorScheme,
   deviceToolbarVisible,
@@ -99,12 +102,12 @@ export function PreviewMoreMenu({
         <MenuItem onClick={callTab(bridge.openDevTools)} disabled={tabDisabled}>
           Open DevTools
         </MenuItem>
-        <MenuItem onClick={onNativePictureInPicture} disabled={tabDisabled}>
+        <MenuItem onClick={onNativePictureInPicture} disabled={tabDisabled || !embeddedSurface}>
           {nativePictureInPicture
             ? "Close separate preview window"
             : "Open separate preview window"}
         </MenuItem>
-        <MenuItem onClick={onToggleDeviceToolbar} disabled={tabDisabled}>
+        <MenuItem onClick={onToggleDeviceToolbar} disabled={tabDisabled || !embeddedSurface}>
           {deviceToolbarVisible ? "Hide device toolbar" : "Show device toolbar"}
         </MenuItem>
         <MenuSub>

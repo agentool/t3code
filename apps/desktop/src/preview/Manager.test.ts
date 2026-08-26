@@ -330,6 +330,14 @@ describe("PreviewManager", () => {
     webviewSend.mockClear();
   });
 
+  effectIt.effect("keeps the existing embedded browser backend as the default", () =>
+    withManager((manager) =>
+      Effect.sync(() => {
+        expect(manager.browserBackend).toBe("embedded");
+      }),
+    ),
+  );
+
   effectIt.effect("reports an unregistered webview as temporarily unavailable", () =>
     withManager((manager) =>
       Effect.gen(function* () {

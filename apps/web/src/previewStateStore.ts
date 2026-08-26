@@ -21,6 +21,8 @@ import { PREVIEW_RECENT_URL_LIMIT } from "./components/preview/previewConstants"
 import { appAtomRegistry } from "./rpc/atomRegistry";
 
 export interface DesktopPreviewOverlay {
+  /** Defaults to embedded for overlays produced by older Desktop clients. */
+  backend?: "embedded" | "external-local";
   hasWebContents: boolean;
   canGoBack: boolean;
   canGoForward: boolean;
